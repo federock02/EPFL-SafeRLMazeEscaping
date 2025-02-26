@@ -1,0 +1,7 @@
+tomli
+
+[all]
+robomimic@ git+https://github.com/ARISE-Initiative/robomimic.git
+
+[robomimic]
+robomimic@ git+https://github.com/ARISE-Initiative/robomimic.git
