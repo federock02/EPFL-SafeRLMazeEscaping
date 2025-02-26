@@ -25,3 +25,5 @@ pyproject.toml
 SECURITY.md
 README.md
 VERSION
+.flake8
+.gitattributes
