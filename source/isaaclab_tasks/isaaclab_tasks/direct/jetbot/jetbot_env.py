@@ -23,7 +23,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     action_scale = 1.0  # TODO
     # 2 wheel control
     action_space = 2
-    observation_space = 6 # x, y, yaw, left_wheel_vel, right_wheel_vel, distance_to_goal
+    observation_space = 7 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y
     state_space = 0
 
     # simulation
@@ -40,16 +40,16 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
 
     # reset
-    max_distance_from_goal = 10.0 # jetbot moved too far from goal
-    initial_pose_radius = 6.0  # the radius around goal in which the jetbot initial position is sampled
+    max_distance_from_goal = 7.0 # jetbot moved too far from goal
+    initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
 
     # reward scales
-    rew_scale_goal = 4.0 # reward for reaching the goal
-    rew_scale_distance = -0.1 # penalty for moving away from the goal
+    rew_scale_goal = 20.0 # reward for reaching the goal
+    rew_scale_distance = 0.1 # penalty for moving away from the goal # using r_d = 1 - exp(-rew_scalse_distance*dist)
     # rew_scale_velocity = 0.1 # reward for moving towards the goal with high velocity
        # might be emerging behavior from high reward for reaching the goal
     # rew_scale_alive = 0.1 # reward for staying alive
-    rew_scale_terminated = -2.0 # penalty for terminating the episode (went too far)
+    rew_scale_terminated = -8.0 # penalty for terminating the episode (went too far)
     # https://arxiv.org/pdf/2002.04109 (r_reached, r_crashed, 1 - exp(decay_rate*dist))
 
     # goal
@@ -72,6 +72,11 @@ class JetBotEnv(DirectRLEnv):
         # cache joint positions and velocities data for efficiency
         self.joint_pos = self.jetbot.data.joint_pos
         self.joint_vel = self.jetbot.data.joint_vel
+
+        # previous distance to goal, used in reward computation
+        self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
+        self.reset_prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
+
 
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
@@ -141,8 +146,8 @@ class JetBotEnv(DirectRLEnv):
         # assume actions are the wheel velocities
         left_action = self.actions[:, 0].unsqueeze(-1)
         right_action = self.actions[:, 1].unsqueeze(-1)
-        print("Left action: ", left_action)
-        print("Right action: ", right_action)
+        #print("Left action: ", left_action)
+        #print("Right action: ", right_action)
         # set the wheel velocities
         self.jetbot.set_joint_velocity_target(left_action, joint_ids=self._left_wheel_idx)
         self.jetbot.set_joint_velocity_target(right_action, joint_ids=self._right_wheel_idx)
@@ -151,22 +156,59 @@ class JetBotEnv(DirectRLEnv):
         # gethering observations
         # position: x, y from the root position
         pos = self.jetbot.data.root_pos_w[:, :2]
-        print("Robot pos: ", pos)
+        #print("Robot pos: ", pos)
+
         # orientation: compute yaw from the root orientation
         orient = self.jetbot.data.root_quat_w
-        yaw = self._compute_yaw(orient)  # helper function defined below.
-        print("Robot yaw: ", yaw)
+        yaw = self._compute_yaw(orient).squeeze(-1)  # helper function defined below.
+        #print("Robot yaw: ", yaw)
+
         # wheel velocities
-        left_wheel_vel = self.joint_vel[:, self._left_wheel_idx].squeeze(-1)
-        right_wheel_vel = self.joint_vel[:, self._right_wheel_idx].squeeze(-1)
+        left_wheel_vel = self.joint_vel[:, self._left_wheel_idx].squeeze(-1).unsqueeze(-1)
+        right_wheel_vel = self.joint_vel[:, self._right_wheel_idx].squeeze(-1).unsqueeze(-1)
+
         # distance to goal (use only x, y coordinates)
-        goal_xy = self.cfg.goal_pos[:2]
+        goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=pos.device)
+        goal_xy = goal_xy.unsqueeze(0).expand(pos.shape[0], -1)
+
         # in order to compute the distance to the goal, we need to convert the goal position to a tensor
         # the goal position tensor needs to be on the same device as the observations
-        dist_to_goal = torch.norm(pos - torch.tensor(goal_xy, device=pos.device), dim=1, keepdim=True)
+        # compute distance to goal per robot
+        dist_to_goal = pos - goal_xy  # shape: [256, 2]
+        # extract x and y differences and ensure each has shape [256, 1]
+        dist_to_goal_x = dist_to_goal[:, 0].unsqueeze(-1)
+        dist_to_goal_y = dist_to_goal[:, 1].unsqueeze(-1)
+        # print("Distance to goal: ", dist_to_goal_x, dist_to_goal_y)
+
+        # compute the angle to the goal using atan2
+        goal_direction = torch.stack((dist_to_goal_x.squeeze(-1), dist_to_goal_y.squeeze(-1)), dim=1)
+        goal_angle = torch.atan2(goal_direction[:, 1], goal_direction[:, 0])
+
+        # compute the angle difference (yaw error)
+        angle_diff = goal_angle - yaw
+        # normalize to range [-π, π] using modulo operation
+        angle_diff = (angle_diff + torch.pi) % (2 * torch.pi) - torch.pi
+        angle_diff = angle_diff.unsqueeze(-1)
+
+        """
+        print("Shapes: ")
+        print("Pos shape: ", pos.shape)
+        print("Angle diff shape: ", angle_diff.shape)
+        print("Left wheel vel shape: ", left_wheel_vel.shape)
+        print("Right wheel vel shape: ", right_wheel_vel.shape)
+        print("Dist to goal x shape: ", dist_to_goal_x.shape)
+        print("Dist to goal y shape: ", dist_to_goal_y.shape)
+        """
 
         # concatenate into a single observation vector
-        obs = torch.cat((pos, yaw.unsqueeze(1), left_wheel_vel.unsqueeze(1), right_wheel_vel.unsqueeze(1), dist_to_goal), dim=-1)
+        obs = torch.cat((pos,
+                         angle_diff,
+                         left_wheel_vel,
+                         right_wheel_vel,
+                         dist_to_goal_x,
+                         dist_to_goal_y
+                        ), dim=-1)
+        #print("Observations shape: ", obs.shape)
         return {"policy": obs}
     
     def _get_rewards(self) -> torch.Tensor:
@@ -179,8 +221,11 @@ class JetBotEnv(DirectRLEnv):
             self.cfg.rew_scale_distance,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
-            self.cfg.max_distance_from_goal # max distance from goal, for termination
+            self.cfg.max_distance_from_goal, # max distance from goal, for termination
+            self.prec_dist
         )
+        self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
+                                     - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -190,7 +235,8 @@ class JetBotEnv(DirectRLEnv):
         # check if the robot has gone out of bounds
         out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_goal, dim=1)
         # check if the robot has reached the goal
-        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2] - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1) <= 0.05
+        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2] 
+                                  - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1) <= 0.1
         # episode is done if any of the conditions are met
         return out_of_bounds | reached_goal, time_out
 
@@ -223,7 +269,9 @@ class JetBotEnv(DirectRLEnv):
         qy = axis[:, 1] * sin_half_angle # already zeros
         qz = axis[:, 2] * sin_half_angle
         qw = cos_half_angle
-        new_orientation = torch.stack([qx, qy, qz, qw], dim=1)
+        new_orientation = torch.stack([qw, qx, qy, qz], dim=1)
+
+        self.prec_dist = self.reset_prec_dist.clone()
 
         # set position and orientation
         default_root_state = self.jetbot.data.default_root_state[env_ids]
@@ -253,16 +301,21 @@ def compute_rewards(
     rew_scale_distance: float,
     robot_pos: torch.Tensor,
     goal_pos: list[float],
-    max_distance_from_goal: float
+    max_distance_from_goal: float,
+    prec_dist: torch.Tensor
 ):
     # compute the distance to the goal
     dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1)
 
     # compute the rewards
-    terminated = (dist_to_goal > max_distance_from_goal).float()
+    terminated = (dist_to_goal >= max_distance_from_goal).float()
     rew_termination = rew_scale_terminated * terminated
     #rew_alive = rew_scale_alive * (1.0 - terminated)
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.05).float()
-    rew_distance = rew_scale_distance * dist_to_goal
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float()
+    #rew_distance = 1.15 - math.exp(rew_scale_distance * dist_to_goal)
+    rew_distance = torch.where(prec_dist == 0.0, 
+                           torch.zeros_like(dist_to_goal), 
+                           prec_dist - dist_to_goal)
     total_reward = rew_termination + rew_goal + rew_distance
+    #print("Total reward: ", total_reward)
     return total_reward

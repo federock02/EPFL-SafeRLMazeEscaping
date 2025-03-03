@@ -1,19 +1,19 @@
 # Reference: https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/ppo.yml#L32
 seed: 42
 
-n_timesteps: !!float 1000
+n_timesteps: !!float 5e6
 policy: 'MlpPolicy'
 n_steps: 16
 batch_size: 128
 gae_lambda: 0.95
-gamma: 0.99
+gamma: 0.98
 n_epochs: 20
 ent_coef: 0.01
 learning_rate: !!float 3e-4
 clip_range: !!float 0.2
 policy_kwargs: "dict(
-                  activation_fn=nn.ELU,
-                  net_arch=[32, 32],
+                  activation_fn=nn.ReLU,
+                  net_arch=[64, 64],
                   squash_output=False,
                 )"
 vf_coef: 1.0
