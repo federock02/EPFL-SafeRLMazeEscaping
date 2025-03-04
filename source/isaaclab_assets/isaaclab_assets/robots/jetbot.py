@@ -35,15 +35,15 @@ JETBOT_CFG = ArticulationCfg(
     actuators={
         "left_wheel": ImplicitActuatorCfg(
             joint_names_expr=["left_wheel_joint"],
-            effort_limit=20.0,
-            velocity_limit=20.0,
+            effort_limit=200.0,
+            velocity_limit=200.0,
             stiffness=0.0,
             damping=2.0,
         ),
         "right_wheel": ImplicitActuatorCfg(
             joint_names_expr=["right_wheel_joint"],
-            effort_limit=20.0,
-            velocity_limit=20.0,
+            effort_limit=200.0,
+            velocity_limit=200.0,
             stiffness=0.0,
             damping=2.0,
         ),

@@ -13,7 +13,9 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.utils.math import sample_uniform
+
+import yaml
+import random
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
@@ -54,7 +56,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     # https://arxiv.org/pdf/2002.04109 (r_reached, r_crashed, 1 - exp(decay_rate*dist))
 
     # goal
-    goal_pos = [0.0, 0.0]  # goal position
+    goals = [[-2.0,1.0], [-2.0,0.0], [2.0,0.0], [0.5,3.5], [-0.5,-3.5]]
 
     # spawn height
     spawn_height = 0.0437
@@ -63,6 +65,7 @@ class JetBotEnv(DirectRLEnv):
     cfg: JetBotEnvCfg
 
     def __init__(self, cfg: JetBotEnvCfg, render_mode: str | None = None, **kwargs):
+        self.maze = Maze()
         super().__init__(cfg, render_mode, **kwargs)
 
         # use the joint names from the configuration to find indices in the articulation
@@ -84,31 +87,14 @@ class JetBotEnv(DirectRLEnv):
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
         # add a cube as a goal
-        goal_size = (0.5, 0.5, 0.5)
-        goal_pos = self.cfg.goal_pos + [goal_size[2] / 2.0]
-        cfg_goal_cube = sim_utils.CuboidCfg(
-            size=goal_size,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.76 , 0.2, 0.92)),
-        )
-        cfg_goal_cube.func(f"/World/Objects/goal", cfg_goal_cube, translation=tuple(goal_pos))
-
-        # add spawn area and bound are circles
-        spawn_area_color = (0.1, 0.8, 0.1)  # green
-        bound_area_color = (0.8, 0.1, 0.1)  # red
-        
-        cfg_spawn_area = sim_utils.CylinderCfg(
-            radius=self.cfg.initial_pose_radius,
-            height=0.006,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=spawn_area_color),
-        )
-        cfg_spawn_area.func("/World/Decals/spawn_area", cfg_spawn_area, translation=(0, 0, 0.003))
-
-        cfg_bound_area = sim_utils.CylinderCfg(
-            radius=self.cfg.max_distance_from_goal,
-            height=0.005,
-            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=bound_area_color),
-        )
-        cfg_bound_area.func("/World/Decals/bound_area", cfg_bound_area, translation=(0, 0, 0.0025))
+        goal_size = (0.25, 0.25, 0.25)
+        for i, g in enumerate(self.cfg.goals):
+            goal_pos = list(g) + [goal_size[2] / 2.0]
+            cfg_goal_cube = sim_utils.CuboidCfg(
+                size=goal_size,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.76, 0.2, 0.92)),
+            )
+            cfg_goal_cube.func(f"/World/Objects/goal_{i}", cfg_goal_cube, translation=tuple(goal_pos))
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
@@ -117,6 +103,8 @@ class JetBotEnv(DirectRLEnv):
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        self.maze.spawn_maze()
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = self.action_scale * actions.clone()
@@ -167,8 +155,12 @@ class JetBotEnv(DirectRLEnv):
         right_wheel_vel = self.joint_vel[:, self._right_wheel_idx].squeeze(-1).unsqueeze(-1)
 
         # distance to goal (use only x, y coordinates)
-        goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=pos.device)
-        goal_xy = goal_xy.unsqueeze(0).expand(pos.shape[0], -1)
+        # picking the closest goal to the robot
+        all_goals = torch.tensor(self.cfg.goals, device=pos.device)
+        diff = pos.unsqueeze(1) - all_goals.unsqueeze(0)
+        dists = torch.norm(diff, dim=-1)
+        closest_idx = torch.argmin(dists, dim=1)
+        goal_xy = all_goals[closest_idx]
 
         # in order to compute the distance to the goal, we need to convert the goal position to a tensor
         # the goal position tensor needs to be on the same device as the observations
@@ -189,16 +181,6 @@ class JetBotEnv(DirectRLEnv):
         angle_diff = (angle_diff + torch.pi) % (2 * torch.pi) - torch.pi
         angle_diff = angle_diff.unsqueeze(-1)
 
-        """
-        print("Shapes: ")
-        print("Pos shape: ", pos.shape)
-        print("Angle diff shape: ", angle_diff.shape)
-        print("Left wheel vel shape: ", left_wheel_vel.shape)
-        print("Right wheel vel shape: ", right_wheel_vel.shape)
-        print("Dist to goal x shape: ", dist_to_goal_x.shape)
-        print("Dist to goal y shape: ", dist_to_goal_y.shape)
-        """
-
         # concatenate into a single observation vector
         obs = torch.cat((pos,
                          angle_diff,
@@ -213,29 +195,37 @@ class JetBotEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
-        total_reward = compute_rewards(
+        total_reward, dist = compute_rewards(
             #self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
-            self.cfg.goal_pos[:2], # shape [1, 2] # goal position
+            self.cfg.goals, # shape [num_goals, 2] # goals positions
             self.cfg.max_distance_from_goal, # max distance from goal, for termination
             self.prec_dist
         )
-        self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
-                                     - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
+        self.prec_dist = dist
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # check if the episode must be terminated
         # check if the episode has run out of time
         time_out = self.episode_length_buf >= self.max_episode_length - 1
+
         # check if the robot has gone out of bounds
         out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_goal, dim=1)
+
         # check if the robot has reached the goal
-        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2] 
-                                  - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1) <= 0.1
+        robot_pos = self.jetbot.data.root_pos_w[:, :2]
+        # convert the list of goal positions into a tensor (shape: [num_goals, 2])
+        all_goals = torch.tensor(self.cfg.goals, device=self.jetbot.data.root_pos_w.device)  
+        # pairwise differences between each robot and each goal
+        diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
+        # Compute Euclidean distances along the last dimension: [num_envs, num_goals]
+        dists = torch.norm(diff, dim=2)
+        # Check if any goal is within 0.1 distance for each robot: [num_envs] boolean tensor
+        reached_goal = torch.any(dists <= 0.1, dim=1)
+
         # episode is done if any of the conditions are met
         return out_of_bounds | reached_goal, time_out
 
@@ -247,15 +237,16 @@ class JetBotEnv(DirectRLEnv):
         # sample a new starting position within initial_pose_radius around the goal
         num_ids = len(env_ids)
 
-        # random angle and radius around goal
-        theta = torch.rand(num_ids, device=self.device) * 2 * math.pi
-        r = torch.sqrt(torch.rand(num_ids, device=self.device)) * self.cfg.initial_pose_radius
-
-        # transform polar coordinates to cartesian coordinates
-        new_x = self.cfg.goal_pos[0] + r * torch.cos(theta)
-        new_y = self.cfg.goal_pos[1] + r * torch.sin(theta)
-        new_z = torch.ones_like(new_x) * self.cfg.spawn_height
-        new_positions = torch.stack([new_x, new_y, new_z], dim=1)
+        safe_positions = []
+        for _ in env_ids:
+            pos_xy = self.maze.sample_safe_position()
+            safe_positions.append(pos_xy)
+        safe_positions = torch.tensor(safe_positions, device=self.device, dtype=torch.float)
+        
+        # set spawn height as defined in cfg (e.g., self.cfg.spawn_height)
+        default_root_state = self.jetbot.data.default_root_state[env_ids]
+        default_root_state[:, :2] = safe_positions
+        default_root_state[:, 2] = self.cfg.spawn_height
 
         # sample a new starting yaw angle
         axis = torch.zeros(num_ids, 3, device=self.device)
@@ -270,12 +261,13 @@ class JetBotEnv(DirectRLEnv):
         qw = cos_half_angle
         new_orientation = torch.stack([qw, qx, qy, qz], dim=1)
 
-        self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
-                                     - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
+        robot_pos = self.jetbot.data.root_pos_w[:, :2]
+        all_goals = torch.tensor(self.cfg.goals, device=robot_pos.device)
+        diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
+        dists = torch.norm(diff, dim=2)
+        self.prec_dist = torch.min(dists, dim=1).values
 
-        # set position and orientation
-        default_root_state = self.jetbot.data.default_root_state[env_ids]
-        default_root_state[:, :3] = new_positions
+        # update the root state
         default_root_state[:, 3:7] = new_orientation
 
         self.jetbot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
@@ -300,12 +292,15 @@ def compute_rewards(
     rew_scale_goal: float,
     rew_scale_distance: float,
     robot_pos: torch.Tensor,
-    goal_pos: list[float],
+    goal_pos: list[list[float]],
     max_distance_from_goal: float,
     prec_dist: torch.Tensor
 ):
     # compute the distance to the goal
-    dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1)
+    all_goals = torch.tensor(goal_pos, device=robot_pos.device)
+    diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
+    dists = torch.norm(diff, dim=2)
+    dist_to_goal, _ = torch.min(dists, dim=1)
 
     # compute the rewards
     terminated = (dist_to_goal >= max_distance_from_goal).float()
@@ -319,4 +314,83 @@ def compute_rewards(
     rew_distance = rew_scale_distance * rew_distance
     total_reward = rew_termination + rew_goal + rew_distance
     #print("Total reward: ", total_reward)
-    return total_reward
+    return total_reward, dist_to_goal
+
+class Maze:
+    def __init__(self):
+        self.walls = []
+
+    def spawn_maze(self):
+        with open("/home/federico/isaaclab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/maze_confi.yaml", "r") as f:
+            maze_config = yaml.safe_load(f)
+        self.walls = maze_config["maze"]["walls"]
+
+        for i, wall in enumerate(self.walls):
+            start = wall["start"]
+            end = wall["end"]
+            prim_path = f"/World/Maze/wall_{i}"
+            self.spawn_wall_cube(prim_path, start, end)
+
+    def spawn_wall_cube(self, prim_path: str, start: list[float], end: list[float], height: float = 0.5, width: float = 0.1):
+        # compute length
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.sqrt(dx * dx + dy * dy)
+        
+        # compute midpoint
+        mid_x = (start[0] + end[0]) / 2.0
+        mid_y = (start[1] + end[1]) / 2.0
+        mid_z = height / 2.0  # place it on the ground
+        translation = (mid_x, mid_y, mid_z)
+
+        size = (length, width, height)
+
+        # compute orientation angle
+        angle_rad = math.atan2(dy, dx)
+        angle_deg = math.degrees(angle_rad)
+
+        theta_rad = math.radians(angle_deg)
+        w = math.cos(theta_rad / 2)
+        x = 0.0
+        y = 0.0
+        z = math.sin(theta_rad / 2)
+        orientation = (w, x, y, z)
+
+        # Create the cuboid configuration using sim_utils
+        cfg_wall_cube = sim_utils.CuboidCfg(
+            size=size,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.14, 0.35))
+        )
+
+        cfg_wall_cube.func(
+            prim_path,
+            cfg_wall_cube,
+            translation=translation,
+            orientation=orientation
+        )
+        
+        return cfg_wall_cube
+
+    def sample_safe_position(self, x_bounds=(-1.5,1.5), y_bounds=(-3.0,3.0), robot_radius=0.15, max_attempts=100, safety_margin=0.1):
+        for _ in range(max_attempts):
+            candidate = [random.uniform(*x_bounds), random.uniform(*y_bounds)]
+            safe = True
+            for wall in self.walls:
+                # for each wall, compute if candidate is within a safety margin.
+                # you might use the distance from the candidate point to the line defined by wall start and end.
+                if self.distance_from_line(candidate, wall["start"], wall["end"]) < robot_radius + safety_margin:
+                    safe = False
+                    break
+            if safe:
+                return candidate
+        return candidate
+    
+    def distance_from_line(self, point, start, end):
+        # compute perpendicular distance from point to the line defined by start and end.
+        import numpy as np
+        p = np.array(point)
+        s = np.array(start)
+        e = np.array(end)
+        if np.allclose(s, e):
+            return np.linalg.norm(p - s)
+        return np.abs(np.cross(e-s, s-p)) / np.linalg.norm(e-s)

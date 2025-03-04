@@ -146,7 +146,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent.set_logger(new_logger)
 
     # callbacks for agent
-    checkpoint_callback = CheckpointCallback(save_freq=1000, save_path=log_dir, name_prefix="model", verbose=2)
+    checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=log_dir, name_prefix="model", verbose=2)
     # train the agent
     agent.learn(total_timesteps=n_timesteps, callback=checkpoint_callback)
     # save the final model
