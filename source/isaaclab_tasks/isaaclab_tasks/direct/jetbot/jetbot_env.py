@@ -15,6 +15,11 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import sample_uniform
 
+from scipy.spatial import KDTree
+from scipy.spatial import distance_matrix
+import numpy as np
+import yaml
+
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
@@ -45,11 +50,12 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # reward scales
     rew_scale_goal = 20.0 # reward for reaching the goal
-    rew_scale_distance = 0.1 # penalty for moving away from the goal # using r_d = 1 - exp(-rew_scalse_distance*dist)
+    rew_scale_distance = 2.0 # reward for moving towards the goal
+    # penalty for moving away from the goal # using r_d = 1 - exp(-rew_scalse_distance*dist)
     # rew_scale_velocity = 0.1 # reward for moving towards the goal with high velocity
        # might be emerging behavior from high reward for reaching the goal
     # rew_scale_alive = 0.1 # reward for staying alive
-    rew_scale_terminated = -8.0 # penalty for terminating the episode (went too far)
+    rew_scale_terminated = -20.0 # penalty for terminating the episode (went too far)
     # https://arxiv.org/pdf/2002.04109 (r_reached, r_crashed, 1 - exp(decay_rate*dist))
 
     # goal
@@ -118,6 +124,9 @@ class JetBotEnv(DirectRLEnv):
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
+
+        maze = Maze()
+        #maze.spawn_maze()
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = self.action_scale * actions.clone()
@@ -316,6 +325,62 @@ def compute_rewards(
     rew_distance = torch.where(prec_dist == 0.0, 
                            torch.zeros_like(dist_to_goal), 
                            prec_dist - dist_to_goal)
+    rew_distance = rew_scale_distance * rew_distance
     total_reward = rew_termination + rew_goal + rew_distance
     #print("Total reward: ", total_reward)
     return total_reward
+
+class Maze:
+    def __init__(self):
+        self.walls = []
+
+    def spawn_maze(self):
+        with open("/home/federico/isaaclab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/maze_confi.yaml", "r") as f:
+            maze_config = yaml.safe_load(f)
+        self.walls = maze_config["maze"]["walls"]
+
+        for i, wall in enumerate(self.walls):
+            start = wall["start"]
+            end = wall["end"]
+            prim_path = f"/World/Maze/wall_{i}"
+            self.spawn_wall_cube(prim_path, start, end)
+
+    def spawn_wall_cube(self, prim_path: str, start: list[float], end: list[float], height: float = 0.5, width: float = 0.1):
+        # compute length
+        dx = end[0] - start[0]
+        dy = end[1] - start[1]
+        length = math.sqrt(dx * dx + dy * dy)
+        
+        # compute midpoint
+        mid_x = (start[0] + end[0]) / 2.0
+        mid_y = (start[1] + end[1]) / 2.0
+        mid_z = height / 2.0  # place it on the ground
+        translation = (mid_x, mid_y, mid_z)
+
+        size = (length, width, height)
+
+        # compute orientation angle
+        angle_rad = math.atan2(dy, dx)
+        angle_deg = math.degrees(angle_rad)
+
+        theta_rad = math.radians(angle_deg)
+        w = math.cos(theta_rad / 2)
+        x = 0.0
+        y = 0.0
+        z = math.sin(theta_rad / 2)
+        orientation = (w, x, y, z)
+
+        # Create the cuboid configuration using sim_utils
+        cfg_wall_cube = sim_utils.CuboidCfg(
+            size=size,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 0.14, 0.35))
+        )
+
+        cfg_wall_cube.func(
+            prim_path,
+            cfg_wall_cube,
+            translation=translation,
+            orientation=orientation
+        )
+        
+        return cfg_wall_cube
