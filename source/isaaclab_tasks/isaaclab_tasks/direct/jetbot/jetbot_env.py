@@ -15,6 +15,9 @@ from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
 from isaaclab.utils.math import sample_uniform
 
+import yaml
+import os
+
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
@@ -45,7 +48,10 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # reward scales
     rew_scale_goal = 20.0 # reward for reaching the goal
-    rew_scale_distance = 5.0 # reward for moving towards the goal
+    rew_scale_distance_delta = 5.0 # reward for moving towards the goal
+    rew_scale_distance_exp = 0.3 # reward for moving towards the goal
+    rew_scale_distance = rew_scale_distance_delta
+
     # penalty for moving away from the goal # using r_d = 1 - exp(-rew_scalse_distance*dist)
     # rew_scale_velocity = 0.1 # reward for moving towards the goal with high velocity
        # might be emerging behavior from high reward for reaching the goal
@@ -58,6 +64,11 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # spawn height
     spawn_height = 0.0437
+
+    # robot geometry
+    wheelbase = 0.12
+    wheelradius = 0.032
+
 
 class JetBotEnv(DirectRLEnv):
     cfg: JetBotEnvCfg
@@ -76,6 +87,14 @@ class JetBotEnv(DirectRLEnv):
 
         # previous distance to goal, used in reward computation
         self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
+
+        # gamma for reward computation
+        config_path = os.path.join(os.path.dirname(__file__), "agents", "sb3_ppo_cfg.yaml")
+        with open(config_path) as stream:
+            try:
+                self.gamma = yaml.safe_load(stream)["gamma"]
+            except yaml.YAMLError as exc:
+                self.gamma = 0.99
 
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
@@ -119,27 +138,22 @@ class JetBotEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = self.action_scale * actions.clone()
+        actions_base = self.action_scale * actions.clone()
 
-        """
         # convert base velocity commands (v, ω) into left and right wheel velocities
-
-        # scale and extract linear & angular velocity from actions
-        self.actions = self.action_scale * actions.clone()
-        v = self.actions[:, 0]  # linear velocity (m/s)
-        omega = self.actions[:, 1]  # angular velocity (rad/s)
+        v = actions_base[:, 0]  # linear velocity (m/s)
+        omega = actions_base[:, 1]  # angular velocity (rad/s)
 
         # get JetBot's wheelbase
-        L = self.wheelbase
+        L = self.cfg.wheelbase
 
         # compute left & right wheel velocities using differential drive formula
         v_left = v - (omega * L / 2)
+        w_left = v_left / self.cfg.wheelradius
         v_right = v + (omega * L / 2)
+        w_right = v_right / self.cfg.wheelradius
 
-        # apply velocities to the robot's wheels
-        self.jetbot.data.joint_vel[:, self.left_wheel_idx] = v_left
-        self.jetbot.data.joint_vel[:, self.right_wheel_idx] = v_right
-        """
+        self.actions = torch.stack((w_left, w_right), dim=1)
 
     def _apply_action(self) -> None:
         # assume actions are the wheel velocities
@@ -221,7 +235,9 @@ class JetBotEnv(DirectRLEnv):
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
             self.cfg.max_distance_from_goal, # max distance from goal, for termination
-            self.prec_dist
+            self.prec_dist,
+            self.episode_length_buf,
+            self.gamma
         )
         self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
                                      - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
@@ -302,7 +318,9 @@ def compute_rewards(
     robot_pos: torch.Tensor,
     goal_pos: list[float],
     max_distance_from_goal: float,
-    prec_dist: torch.Tensor
+    prec_dist: torch.Tensor,
+    episode_length_buf: torch.Tensor,
+    gamma: float
 ):
     # compute the distance to the goal
     dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1)
@@ -311,11 +329,9 @@ def compute_rewards(
     terminated = (dist_to_goal >= max_distance_from_goal).float()
     rew_termination = rew_scale_terminated * terminated
     #rew_alive = rew_scale_alive * (1.0 - terminated)
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float()
-    #rew_distance = 1.15 - math.exp(rew_scale_distance * dist_to_goal)
-    rew_distance = torch.where(prec_dist == 0.0, 
-                           torch.zeros_like(dist_to_goal), 
-                           prec_dist - dist_to_goal)
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
+    #rew_distance = 10 - math.exp(rew_scale_distance * dist_to_goal)
+    rew_distance = torch.where(prec_dist == 0.0, torch.zeros_like(dist_to_goal), prec_dist - dist_to_goal)
     rew_distance = rew_scale_distance * rew_distance
     total_reward = rew_termination + rew_goal + rew_distance
     #print("Total reward: ", total_reward)
