@@ -13,7 +13,6 @@ from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
-from isaaclab.utils.math import sample_uniform
 
 import yaml
 import os
@@ -26,7 +25,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     action_scale = 1.0  # TODO
     # 2 wheel control
     action_space = 2
-    observation_space = 7 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y
+    observation_space = 7 # x, y, yaw_diff, base_v, base_omega, distance_to_goal_x, distance_to_goal_y
     state_space = 0
 
     # simulation
@@ -47,16 +46,18 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
 
     # reward scales
-    rew_scale_goal = 20.0 # reward for reaching the goal
-    rew_scale_distance_delta = 5.0 # reward for moving towards the goal
+    rew_scale_goal = 30.0 # reward for reaching the goal
+
+    rew_scale_distance_delta = 30.0 # reward for moving towards the goal
     rew_scale_distance_exp = 0.3 # reward for moving towards the goal
     rew_scale_distance = rew_scale_distance_delta
+    rew_scale_time = -0.003 # penalty for taking too long
 
     # penalty for moving away from the goal # using r_d = 1 - exp(-rew_scalse_distance*dist)
     # rew_scale_velocity = 0.1 # reward for moving towards the goal with high velocity
        # might be emerging behavior from high reward for reaching the goal
     # rew_scale_alive = 0.1 # reward for staying alive
-    rew_scale_terminated = -20.0 # penalty for terminating the episode (went too far)
+    rew_scale_terminated = -50.0 # penalty for terminating the episode (went too far)
     # https://arxiv.org/pdf/2002.04109 (r_reached, r_crashed, 1 - exp(decay_rate*dist))
 
     # goal
@@ -138,20 +139,11 @@ class JetBotEnv(DirectRLEnv):
         light_cfg.func("/World/Light", light_cfg)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
+        self.actions = self.action_scale * actions.clone()
+        return
         actions_base = self.action_scale * actions.clone()
 
-        # convert base velocity commands (v, ω) into left and right wheel velocities
-        v = actions_base[:, 0]  # linear velocity (m/s)
-        omega = actions_base[:, 1]  # angular velocity (rad/s)
-
-        # get JetBot's wheelbase
-        L = self.cfg.wheelbase
-
-        # compute left & right wheel velocities using differential drive formula
-        v_left = v - (omega * L / 2)
-        w_left = v_left / self.cfg.wheelradius
-        v_right = v + (omega * L / 2)
-        w_right = v_right / self.cfg.wheelradius
+        w_left, w_right = direct_diff_drive(actions_base[:, 0], actions_base[:, 1], self.cfg.wheelbase, self.cfg.wheelradius)
 
         self.actions = torch.stack((w_left, w_right), dim=1)
 
@@ -179,6 +171,8 @@ class JetBotEnv(DirectRLEnv):
         # wheel velocities
         left_wheel_vel = self.joint_vel[:, self._left_wheel_idx].squeeze(-1).unsqueeze(-1)
         right_wheel_vel = self.joint_vel[:, self._right_wheel_idx].squeeze(-1).unsqueeze(-1)
+
+        base_v, base_omega = inverse_diff_drive(left_wheel_vel, right_wheel_vel, self.cfg.wheelbase, self.cfg.wheelradius)
 
         # distance to goal (use only x, y coordinates)
         goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=pos.device)
@@ -216,8 +210,10 @@ class JetBotEnv(DirectRLEnv):
         # concatenate into a single observation vector
         obs = torch.cat((pos,
                          angle_diff,
-                         left_wheel_vel,
-                         right_wheel_vel,
+                         #left_wheel_vel,
+                         #right_wheel_vel,
+                         base_v,
+                         base_omega,
                          dist_to_goal_x,
                          dist_to_goal_y
                         ), dim=-1)
@@ -227,11 +223,12 @@ class JetBotEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
-        total_reward = compute_rewards(
+        total_reward, dist = compute_rewards(
             #self.cfg.rew_scale_alive,
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
+            self.cfg.rew_scale_time,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
             self.cfg.max_distance_from_goal, # max distance from goal, for termination
@@ -239,8 +236,7 @@ class JetBotEnv(DirectRLEnv):
             self.episode_length_buf,
             self.gamma
         )
-        self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
-                                     - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
+        self.prec_dist = dist
         return total_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
@@ -315,6 +311,7 @@ def compute_rewards(
     rew_scale_terminated: float,
     rew_scale_goal: float,
     rew_scale_distance: float,
+    rew_scale_time: float,
     robot_pos: torch.Tensor,
     goal_pos: list[float],
     max_distance_from_goal: float,
@@ -329,10 +326,45 @@ def compute_rewards(
     terminated = (dist_to_goal >= max_distance_from_goal).float()
     rew_termination = rew_scale_terminated * terminated
     #rew_alive = rew_scale_alive * (1.0 - terminated)
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
+
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
+    """
+    rew_goal_unclamped = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
+    mask = rew_goal_unclamped > 0
+    rew_goal = torch.where(mask, torch.clamp(rew_goal_unclamped, min=10.0), rew_goal_unclamped)
+    if (rew_goal_unclamped > 0).any():
+        print("At least one reached the goal!")
+        print("Rew goal: ", rew_goal_unclamped)
+        print("Episode: ", episode_length_buf)
+    """
+    #rew_goal = 200 - episode_length_buf/10
+
     #rew_distance = 10 - math.exp(rew_scale_distance * dist_to_goal)
     rew_distance = torch.where(prec_dist == 0.0, torch.zeros_like(dist_to_goal), prec_dist - dist_to_goal)
     rew_distance = rew_scale_distance * rew_distance
+
+    rew_time = rew_scale_time * episode_length_buf
+
     total_reward = rew_termination + rew_goal + rew_distance
     #print("Total reward: ", total_reward)
-    return total_reward
+    return total_reward, dist_to_goal
+
+def direct_diff_drive(v, omega, L, r):
+    # convert base velocity commands (v, ω) into left and right wheel velocities
+
+    # compute left & right wheel velocities using differential drive formula
+    v_left = v - (omega * L / 2)
+    w_left = v_left / r
+    v_right = v + (omega * L / 2)
+    w_right = v_right / r
+
+    return w_left, w_right
+
+def inverse_diff_drive(w_left, w_right, L, r):
+    # convert left and right wheel velocities into base velocity commands (v, ω)
+
+    # compute linear and angular velocities using differential drive formula
+    v = (r / 2) * (w_left + w_right)
+    omega = (r / L) * (w_right - w_left)
+
+    return v, omega
