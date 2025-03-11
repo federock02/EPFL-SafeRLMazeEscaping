@@ -96,6 +96,8 @@ class JetBotEnv(DirectRLEnv):
                 self.gamma = yaml.safe_load(stream)["gamma"]
             except yaml.YAMLError as exc:
                 self.gamma = 0.99
+        
+        self.i = 0
 
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
@@ -236,6 +238,8 @@ class JetBotEnv(DirectRLEnv):
             self.episode_length_buf,
             self.gamma
         )
+        self.i += 1
+        print("i: ", self.i)
         self.prec_dist = dist
         return total_reward
 
