@@ -27,3 +27,5 @@ README.md
 VERSION
 .flake8
 .gitattributes
+rewards_log.npy
+source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/plot_rewards.ipynb
