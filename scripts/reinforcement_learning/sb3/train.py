@@ -156,6 +156,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     agent = PPO(policy_arch, env, verbose=1, **agent_cfg)
     # configure the logger
     new_logger = configure(log_dir, ["stdout", "tensorboard"])
+    #new_logger = configure(log_dir, ["tensorboard"])
     agent.set_logger(new_logger)
 
     # callbacks for agent

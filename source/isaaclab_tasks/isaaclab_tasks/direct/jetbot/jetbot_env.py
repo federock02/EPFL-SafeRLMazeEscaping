@@ -17,11 +17,14 @@ from isaaclab.utils import configclass
 import yaml
 import os
 
+import numpy as np
+import h5py
+
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 1
-    episode_length_s = 20.0
+    episode_length_s = 30.0
     action_scale = 1.0  # TODO
     # 2 wheel control
     action_space = 2
@@ -43,10 +46,11 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # reset
     max_distance_from_goal = 7.0 # jetbot moved too far from goal
+    initial_pose_min_distance = 0.2  # the minimum distance from the goal
     initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
 
     # reward scales
-    rew_scale_goal = 30.0 # reward for reaching the goal
+    rew_scale_goal = 50.0 # reward for reaching the goal
 
     rew_scale_distance_delta = 30.0 # reward for moving towards the goal
     rew_scale_distance_exp = 0.3 # reward for moving towards the goal
@@ -96,8 +100,6 @@ class JetBotEnv(DirectRLEnv):
                 self.gamma = yaml.safe_load(stream)["gamma"]
             except yaml.YAMLError as exc:
                 self.gamma = 0.99
-        
-        self.i = 0
 
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
@@ -225,8 +227,7 @@ class JetBotEnv(DirectRLEnv):
     def _get_rewards(self) -> torch.Tensor:
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
-        total_reward, dist = compute_rewards(
-            #self.cfg.rew_scale_alive,
+        goal_r, term_r, dist_r, total_reward, dist = compute_rewards(
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
@@ -238,8 +239,22 @@ class JetBotEnv(DirectRLEnv):
             self.episode_length_buf,
             self.gamma
         )
-        self.i += 1
-        print("i: ", self.i)
+
+        goal_rew_mean = goal_r.mean().item()
+        goal_rew_std = goal_r.std().item()
+        termination_rew_mean = term_r.mean().item()
+        termination_rew_std = term_r.std().item()
+        distance_rew_mean = dist_r.mean().item()
+        distance_rew_std = dist_r.std().item()
+        total_rew_mean = total_reward.mean().item()
+        total_rew_std = total_reward.std().item()
+
+
+        log_rewards_to_npy(goal_rew_mean, goal_rew_std,
+                            termination_rew_mean, termination_rew_std,
+                            distance_rew_mean, distance_rew_std,
+                            total_rew_mean, total_rew_std)
+
         self.prec_dist = dist
         return total_reward
 
@@ -265,7 +280,12 @@ class JetBotEnv(DirectRLEnv):
 
         # random angle and radius around goal
         theta = torch.rand(num_ids, device=self.device) * 2 * math.pi
-        r = torch.sqrt(torch.rand(num_ids, device=self.device)) * self.cfg.initial_pose_radius
+        r = torch.sqrt(
+            torch.rand(num_ids, device=self.device) * 
+            (self.cfg.initial_pose_radius**2 - self.cfg.initial_pose_min_distance**2) + 
+            self.cfg.initial_pose_min_distance**2
+        )
+
 
         # transform polar coordinates to cartesian coordinates
         new_x = self.cfg.goal_pos[0] + r * torch.cos(theta)
@@ -286,8 +306,7 @@ class JetBotEnv(DirectRLEnv):
         qw = cos_half_angle
         new_orientation = torch.stack([qw, qx, qy, qz], dim=1)
 
-        self.prec_dist = torch.norm(self.jetbot.data.root_pos_w[:, :2]
-                                     - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1)
+        self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
 
         # set position and orientation
         default_root_state = self.jetbot.data.default_root_state[env_ids]
@@ -332,26 +351,24 @@ def compute_rewards(
     #rew_alive = rew_scale_alive * (1.0 - terminated)
 
     rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
-    """
-    rew_goal_unclamped = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
-    mask = rew_goal_unclamped > 0
-    rew_goal = torch.where(mask, torch.clamp(rew_goal_unclamped, min=10.0), rew_goal_unclamped)
-    if (rew_goal_unclamped > 0).any():
-        print("At least one reached the goal!")
-        print("Rew goal: ", rew_goal_unclamped)
-        print("Episode: ", episode_length_buf)
-    """
     #rew_goal = 200 - episode_length_buf/10
 
     #rew_distance = 10 - math.exp(rew_scale_distance * dist_to_goal)
-    rew_distance = torch.where(prec_dist == 0.0, torch.zeros_like(dist_to_goal), prec_dist - dist_to_goal)
+    rew_distance = torch.where(
+        (prec_dist == 0.0) | torch.isclose(prec_dist - dist_to_goal, torch.tensor(0.0, device=prec_dist.device), atol=1e-6), 
+        torch.zeros_like(dist_to_goal), 
+        prec_dist - dist_to_goal
+    )
+
     rew_distance = rew_scale_distance * rew_distance
 
-    rew_time = rew_scale_time * episode_length_buf
+    #rew_time = rew_scale_time * episode_length_buf
+
 
     total_reward = rew_termination + rew_goal + rew_distance
+    #total_reward = rew_distance
     #print("Total reward: ", total_reward)
-    return total_reward, dist_to_goal
+    return rew_goal, rew_termination, rew_distance, total_reward, dist_to_goal
 
 def direct_diff_drive(v, omega, L, r):
     # convert base velocity commands (v, ω) into left and right wheel velocities
@@ -372,3 +389,22 @@ def inverse_diff_drive(w_left, w_right, L, r):
     omega = (r / L) * (w_right - w_left)
 
     return v, omega
+
+def log_rewards_to_npy(goal_rew_mean, goal_rew_std, termination_rew_mean, termination_rew_std, 
+                        distance_rew_mean, distance_rew_std, total_rew_mean, total_rew_std, filename="rewards_log.npy"):
+    try:
+        # Try to load existing rewards
+        rewards = np.load(filename)
+    except FileNotFoundError:
+        # If the file does not exist, create a new one
+        rewards = np.array([[goal_rew_mean, goal_rew_std, termination_rew_mean, termination_rew_std,
+                             distance_rew_mean, distance_rew_std, total_rew_mean, total_rew_std]])
+
+    # Append new rewards
+    new_rewards = np.array([[goal_rew_mean, goal_rew_std, termination_rew_mean, termination_rew_std,
+                             distance_rew_mean, distance_rew_std, total_rew_mean, total_rew_std]])
+
+    rewards = np.vstack([rewards, new_rewards])  # Stack new rewards on top
+
+    # Save the updated rewards to the .npy file
+    np.save(filename, rewards)
