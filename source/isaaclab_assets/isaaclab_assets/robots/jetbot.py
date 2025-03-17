@@ -48,7 +48,7 @@ JETBOT_CFG = ArticulationCfg(
             effort_limit=500.0,
             velocity_limit=500.0,
             stiffness=0.0,
-            damping=2.0,
+            damping=5.0,
         ),
     },
 )

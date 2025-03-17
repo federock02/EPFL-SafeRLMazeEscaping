@@ -18,7 +18,6 @@ import yaml
 import os
 
 import numpy as np
-import h5py
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
@@ -231,7 +230,6 @@ class JetBotEnv(DirectRLEnv):
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
-            self.cfg.rew_scale_time,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
             self.cfg.max_distance_from_goal, # max distance from goal, for termination
@@ -334,7 +332,6 @@ def compute_rewards(
     rew_scale_terminated: float,
     rew_scale_goal: float,
     rew_scale_distance: float,
-    rew_scale_time: float,
     robot_pos: torch.Tensor,
     goal_pos: list[float],
     max_distance_from_goal: float,

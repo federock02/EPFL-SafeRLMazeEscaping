@@ -23,7 +23,7 @@ import random
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 1
-    episode_length_s = 20.0
+    episode_length_s = 30.0
     action_scale = 1.0  # TODO
     # 2 wheel control
     action_space = 2
@@ -48,7 +48,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # reward scales
     rew_scale_goal = 40.0 # reward for reaching the goal
-    rew_scale_distance = 35.0 # reward for moving towards the goal
+    rew_scale_distance = 15.0 # reward for moving towards the goal
     rew_obstacle_intercept = -20.0
     rew_obstacle_slope = 70.0 # penalty for hitting an obstacle
     rew_scale_time = -0.01 # penalty for taking too long
@@ -101,7 +101,7 @@ class JetBotEnv(DirectRLEnv):
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
         # add a cube as a goal
-        goal_size = (0.25, 0.25, 0.25)
+        goal_size = (0.6, 0.6, 0.25)
         for i, g in enumerate(self.cfg.goals):
             goal_pos = list(g) + [goal_size[2] / 2.0]
             cfg_goal_cube = sim_utils.CuboidCfg(
@@ -249,7 +249,7 @@ class JetBotEnv(DirectRLEnv):
         # Compute Euclidean distances along the last dimension: [num_envs, num_goals]
         dists = torch.norm(diff, dim=2)
         # Check if any goal is within 0.1 distance for each robot: [num_envs] boolean tensor
-        reached_goal = torch.any(dists <= 0.1, dim=1)
+        reached_goal = torch.any(dists <= 0.3, dim=1)
 
         # episode is done if any of the conditions are met
         return out_of_bounds | reached_goal, time_out
@@ -331,7 +331,7 @@ def compute_rewards(
     dist_to_goal, _ = torch.min(dists, dim=1)
 
     # compute the rewards
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float()
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.3).float()
     
     rew_distance = torch.where(prec_dist == 0.0, 
                            torch.zeros_like(dist_to_goal), 
@@ -340,8 +340,8 @@ def compute_rewards(
 
 
     rew_obstacle = torch.where(dist_to_obs > 0.0, rew_obstacle_slope*dist_to_obs + rew_obstacle_intercept, torch.tensor(0.0)).sum(dim=1)
-    delay_slope = 1300000
-    delay_episode = 5e6
+    delay_slope = 10e6
+    delay_episode = 10e6
     obstacle_delay = -math.exp(-(i-delay_episode)/delay_slope)+1    
     if obstacle_delay < 0:
         total_reward = rew_goal + rew_distance

@@ -17,16 +17,16 @@ from isaaclab.utils import configclass
 
 import yaml
 import os
+import random
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 1
-    episode_length_s = 30.0
-    action_scale = 1.0  # TODO
-    # 2 wheel control
+    episode_length_s = 20.0
+    action_scale = 10.0
     action_space = 2
-    observation_space = 7 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y
+    observation_space = 10 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y, 3*distance_to_obstacle
     state_space = 0
 
     # simulation
@@ -41,18 +41,23 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     # scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
-
+    
     # reset
-    max_distance_from_center = 7.0 # jetbot moved too far from goal
+    max_distance_from_goal = 8.0 # jetbot moved too far from goal
+    initial_pose_min_distance = 2.5  # the minimum distance from the goal
+    initial_pose_radius = 6.0  # the radius around goal in which the jetbot initial position is sampled
 
     # reward scales
-    rew_scale_goal = 50.0 # reward for reaching the goal
-    rew_scale_distance = 25.0 # reward for moving towards the goal
-    rew_scale_terminated = -50.0 # penalty for terminating the episode
+    rew_scale_goal = 40.0 # reward for reaching the goal
+    rew_scale_distance = 15.0 # reward for moving towards the goal
+    rew_scale_terminated = -50.0 # penalty for termination
+
+    cost_obstacle_slope = -70.0
+    cost_obstacle_intercept = 20.0
+    min_dist_to_obstacle = 0.18
 
     # goal
-    goals = [[-2.0,1.0], [-2.0,0.0], [2.0,0.0], [0.5,3.5], [-0.5,-3.5]]
-    # goals = [[-2.0, 0.0], [2.0, 0.0]]
+    goal_pos = [0.0, 0.0]
 
     # spawn height
     spawn_height = 0.0437
@@ -88,6 +93,9 @@ class JetBotEnv(DirectRLEnv):
             except yaml.YAMLError as exc:
                 self.gamma = 0.99
 
+        self.dual_multiplier = 1.0
+        self._computed_constraint_cost = None
+
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
 
@@ -95,14 +103,31 @@ class JetBotEnv(DirectRLEnv):
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg())
 
         # add a cube as a goal
-        goal_size = (0.25, 0.25, 0.25)
-        for i, g in enumerate(self.cfg.goals):
-            goal_pos = list(g) + [goal_size[2] / 2.0]
-            cfg_goal_cube = sim_utils.CuboidCfg(
-                size=goal_size,
-                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.76, 0.2, 0.92)),
-            )
-            cfg_goal_cube.func(f"/World/Objects/goal_{i}", cfg_goal_cube, translation=tuple(goal_pos))
+        goal_size = (0.5, 0.5, 0.5)
+        goal_pos = self.cfg.goal_pos + [goal_size[2] / 2.0]
+        cfg_goal_cube = sim_utils.CuboidCfg(
+            size=goal_size,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.76 , 0.2, 0.92)),
+        )
+        cfg_goal_cube.func(f"/World/Objects/goal", cfg_goal_cube, translation=tuple(goal_pos))
+
+                # add spawn area and bound are circles
+        spawn_area_color = (0.1, 0.8, 0.1)  # green
+        bound_area_color = (0.8, 0.1, 0.1)  # red
+        
+        cfg_spawn_area = sim_utils.CylinderCfg(
+            radius=self.cfg.initial_pose_radius,
+            height=0.006,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=spawn_area_color),
+        )
+        cfg_spawn_area.func("/World/Decals/spawn_area", cfg_spawn_area, translation=(0, 0, 0.003))
+
+        cfg_bound_area = sim_utils.CylinderCfg(
+            radius=self.cfg.max_distance_from_goal,
+            height=0.005,
+            visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=bound_area_color),
+        )
+        cfg_bound_area.func("/World/Decals/bound_area", cfg_bound_area, translation=(0, 0, 0.0025))
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
@@ -116,13 +141,6 @@ class JetBotEnv(DirectRLEnv):
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = self.action_scale * actions.clone()
-        return
-        actions_base = self.action_scale * actions.clone()
-
-        w_left, w_right = direct_diff_drive(actions_base[:, 0], actions_base[:, 1], self.cfg.wheelbase, self.cfg.wheelradius)
-
-        self.actions = torch.stack((w_left, w_right), dim=1)
-
 
     def _apply_action(self) -> None:
         # assume actions are the wheel velocities
@@ -140,6 +158,8 @@ class JetBotEnv(DirectRLEnv):
         pos = self.jetbot.data.root_pos_w[:, :2]
         #print("Robot pos: ", pos)
 
+        dist_to_obs = self.maze.check_collision(pos, self.cfg.min_dist_to_obstacle)
+
         # orientation: compute yaw from the root orientation
         orient = self.jetbot.data.root_quat_w
         yaw = self._compute_yaw(orient).squeeze(-1)  # helper function defined below.
@@ -152,18 +172,14 @@ class JetBotEnv(DirectRLEnv):
         base_v, base_omega = inverse_diff_drive(left_wheel_vel, right_wheel_vel, self.cfg.wheelbase, self.cfg.wheelradius)
 
         # distance to goal (use only x, y coordinates)
-        # picking the closest goal to the robot
-        all_goals = torch.tensor(self.cfg.goals, device=pos.device)
-        diff = pos.unsqueeze(1) - all_goals.unsqueeze(0)
-        dists = torch.norm(diff, dim=-1)
-        closest_idx = torch.argmin(dists, dim=1)
-        goal_xy = all_goals[closest_idx]
+        goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=pos.device)
+        goal_xy = goal_xy.unsqueeze(0).expand(pos.shape[0], -1)
 
         # in order to compute the distance to the goal, we need to convert the goal position to a tensor
         # the goal position tensor needs to be on the same device as the observations
         # compute distance to goal per robot
-        dist_to_goal = pos - goal_xy  # shape: [num_robots, 2]
-        # extract x and y differences and ensure each has shape [num_robots, 1]
+        dist_to_goal = pos - goal_xy  # shape: [256, 2]
+        # extract x and y differences and ensure each has shape [256, 1]
         dist_to_goal_x = dist_to_goal[:, 0].unsqueeze(-1)
         dist_to_goal_y = dist_to_goal[:, 1].unsqueeze(-1)
         # print("Distance to goal: ", dist_to_goal_x, dist_to_goal_y)
@@ -181,12 +197,11 @@ class JetBotEnv(DirectRLEnv):
         # concatenate into a single observation vector
         obs = torch.cat((pos,
                          angle_diff,
-                         #left_wheel_vel,
-                         #right_wheel_vel,
                          base_v,
                          base_omega,
                          dist_to_goal_x,
                          dist_to_goal_y,
+                         dist_to_obs,
                         ), dim=-1)
         return {"policy": obs}
     
@@ -194,38 +209,47 @@ class JetBotEnv(DirectRLEnv):
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
 
-        total_reward, dist = compute_rewards(
+        dist_to_obs = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2], self.cfg.min_dist_to_obstacle)
+        #print("Distance to obstacles: ", dist_to_obs)
+
+        # compute rewards
+        # combination of reaching the goal, moving towards the goal, and penalizing termination
+        goal_r, term_r, dist_r, primary_reward, dist = compute_rewards(
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
-            self.cfg.max_distance_from_center, # max distance from goal
-            self.cfg.goals, # shape [num_goals, 2] # goals positions
+            self.cfg.goal_pos[:2], # shape [1, 2] # goal position
+            self.cfg.max_distance_from_goal, # max distance from goal, for termination
             self.prec_dist,
             self.episode_length_buf,
             self.gamma
         )
+        print("Primary reward: ", primary_reward)
+
         self.prec_dist = dist
-        return total_reward
+
+        constraint_cost = compute_cost(
+            self.cfg.cost_obstacle_slope,
+            self.cfg.cost_obstacle_intercept,
+            dist_to_obs,
+        )
+        self._computed_constraint_cost = constraint_cost
+        print("Constraint cost: ", constraint_cost)
+
+        return primary_reward - self.dual_multiplier * constraint_cost
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # check if the episode has run out of time
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
         # check if the robot has gone out of bounds
-        out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_center, dim=1)
+        out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_goal, dim=1)
 
         # check if the robot has reached the goal
-        robot_pos = self.jetbot.data.root_pos_w[:, :2]
-        # convert the list of goal positions into a tensor (shape: [num_goals, 2])
-        all_goals = torch.tensor(self.cfg.goals, device=self.jetbot.data.root_pos_w.device)  
-        # pairwise differences between each robot and each goal
-        diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
-        # Compute Euclidean distances along the last dimension: [num_envs, num_goals]
-        dists = torch.norm(diff, dim=2)
-        # Check if any goal is within 0.1 distance for each robot: [num_envs] boolean tensor
-        reached_goal = torch.any(dists <= 0.1, dim=1)
-
+        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2] 
+                                  - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1) <= 0.1
+            
         # episode is done if any of the conditions are met
         return out_of_bounds | reached_goal, time_out
 
@@ -237,16 +261,20 @@ class JetBotEnv(DirectRLEnv):
         # sample a new starting position within initial_pose_radius around the goal
         num_ids = len(env_ids)
 
-        safe_positions = []
-        for _ in env_ids:
-            pos_xy = self.maze.sample_safe_position(robot_radius=self.cfg.wheelbase/2)
-            safe_positions.append(pos_xy)
-        safe_positions = torch.tensor(safe_positions, device=self.device, dtype=torch.float)
-        
-        # set spawn height as defined in cfg (e.g., self.cfg.spawn_height)
-        default_root_state = self.jetbot.data.default_root_state[env_ids]
-        default_root_state[:, :2] = safe_positions
-        default_root_state[:, 2] = self.cfg.spawn_height
+        # random angle and radius around goal
+        theta = torch.rand(num_ids, device=self.device) * 2 * math.pi
+        r = torch.sqrt(
+            torch.rand(num_ids, device=self.device) * 
+            (self.cfg.initial_pose_radius**2 - self.cfg.initial_pose_min_distance**2) + 
+            self.cfg.initial_pose_min_distance**2
+        )
+
+
+        # transform polar coordinates to cartesian coordinates
+        new_x = self.cfg.goal_pos[0] + r * torch.cos(theta)
+        new_y = self.cfg.goal_pos[1] + r * torch.sin(theta)
+        new_z = torch.ones_like(new_x) * self.cfg.spawn_height
+        new_positions = torch.stack([new_x, new_y, new_z], dim=1)
 
         # sample a new starting yaw angle
         axis = torch.zeros(num_ids, 3, device=self.device)
@@ -263,7 +291,9 @@ class JetBotEnv(DirectRLEnv):
 
         self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
 
-        # update the root state
+        # set position and orientation
+        default_root_state = self.jetbot.data.default_root_state[env_ids]
+        default_root_state[:, :3] = new_positions
         default_root_state[:, 3:7] = new_orientation
 
         self.jetbot.write_root_pose_to_sim(default_root_state[:, :7], env_ids)
@@ -277,6 +307,13 @@ class JetBotEnv(DirectRLEnv):
         # calculate yaw using the standard formula
         yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
         return yaw
+    
+    def _set_dual_multiplier(self, value: float) -> None:
+        self.dual_multiplier = value
+
+    def _get_constraint_cost(self):
+        return self._computed_constraint_cost
+
 
 # decorator to compile the function to TorchScript
 # https://pytorch.org/docs/stable/jit.html
@@ -287,35 +324,55 @@ def compute_rewards(
     rew_scale_goal: float,
     rew_scale_distance: float,
     robot_pos: torch.Tensor,
-    max_distance_from_center: float,
-    goal_pos: list[list[float]],
+    goal_pos: list[float],
+    max_distance_from_goal: float,
     prec_dist: torch.Tensor,
     episode_length_buf: torch.Tensor,
     gamma: float
 ):
-    # compute the distance to the center
-    dist_to_center = torch.norm(robot_pos - torch.tensor([0.0, 0.0], device=robot_pos.device), dim=1)
-    terminated = (dist_to_center >= max_distance_from_center).float()
-    rew_termination = rew_scale_terminated * terminated
-
     # compute the distance to the goal
-    all_goals = torch.tensor(goal_pos, device=robot_pos.device)
-    diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
-    dists = torch.norm(diff, dim=2)
-    dist_to_goal, _ = torch.min(dists, dim=1)
+    dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1)
 
     # compute the rewards
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.11).float()
-    
-    rew_distance = torch.where(prec_dist == 0.0, 
-                           torch.zeros_like(dist_to_goal), 
-                           prec_dist - dist_to_goal)
+    terminated = (dist_to_goal >= max_distance_from_goal).float()
+    rew_termination = rew_scale_terminated * terminated
+    #rew_alive = rew_scale_alive * (1.0 - terminated)
+
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
+    #rew_goal = 200 - episode_length_buf/10
+
+    #rew_distance = 10 - math.exp(rew_scale_distance * dist_to_goal)
+    rew_distance = torch.where(
+        (prec_dist == 0.0) | torch.isclose(prec_dist - dist_to_goal, torch.tensor(0.0, device=prec_dist.device), atol=1e-6), 
+        torch.zeros_like(dist_to_goal), 
+        prec_dist - dist_to_goal
+    )
+
     rew_distance = rew_scale_distance * rew_distance
 
-    total_reward = rew_goal + rew_distance + rew_termination
-    
+    #rew_time = rew_scale_time * episode_length_buf
+
+
+    total_reward = rew_termination + rew_goal + rew_distance
+    #total_reward = rew_distance
     #print("Total reward: ", total_reward)
-    return total_reward, dist_to_goal
+    return rew_goal, rew_termination, rew_distance, total_reward, dist_to_goal
+
+@torch.jit.script
+def compute_cost(
+    cost_obstacle_slope: float,
+    cost_obstacle_intercept: float,
+    dist_to_obs: torch.Tensor,
+):
+    
+    cost_obstacles = torch.where(dist_to_obs >= 0.0, cost_obstacle_slope*dist_to_obs + cost_obstacle_intercept, torch.tensor(0.0)).sum(dim=1)
+    return cost_obstacles
+
+
+
+
+
+# define the Maze class
 
 class Maze:
     def __init__(self):
@@ -325,7 +382,7 @@ class Maze:
 
     def spawn_maze(self, width=0.1, height=0.5):
         base_path = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.join(base_path, "maze_cfg.yaml")
+        config_path = os.path.join(base_path, "obs_cfg.yaml")
 
         with open(config_path, "r") as f:
             maze_config = yaml.safe_load(f)
@@ -384,51 +441,6 @@ class Maze:
         )
         
         return cfg_wall_cube
-
-    def sample_safe_position(self, x_bounds=(-1.5,1.5), y_bounds=(-3.0,3.0), robot_radius=0.6, max_attempts=100, safety_margin=0.05):
-
-        device = self.walls_start_tensor.device
-
-        # generate max_attempts candidate positions uniformly within the specified bounds.
-        # candidates: shape (max_attempts, 2)
-        candidates = torch.empty((max_attempts, 2), device=device)
-        candidates[:, 0] = torch.rand(max_attempts, device=device) * (x_bounds[1] - x_bounds[0]) + x_bounds[0]
-        candidates[:, 1] = torch.rand(max_attempts, device=device) * (y_bounds[1] - y_bounds[0]) + y_bounds[0]
-        
-        # precomputed wall tensors: shape (M, 2) each
-        # expand dimensions to allow broadcasting:
-        # candidates: (A, 2) -> (A, 1, 2)
-        # walls_start_tensor: (M, 2) -> (1, M, 2)
-        cand_exp = candidates.unsqueeze(1)         # (A, 1, 2)
-        walls_start = self.walls_start_tensor.unsqueeze(0)  # (1, M, 2)
-        walls_end   = self.walls_end_tensor.unsqueeze(0)    # (1, M, 2)
-
-        # compute wall directions and their norms (avoid division by zero):
-        wall_dirs = walls_end - walls_start          # (1, M, 2)
-        norm_wall_dirs = torch.norm(wall_dirs, dim=2)  # (1, M)
-        norm_wall_dirs = torch.where(norm_wall_dirs == 0, 
-                                    torch.tensor(1e-6, device=device), 
-                                    norm_wall_dirs)
-
-        # compute the vector from each wall's start to each candidate:
-        vec = cand_exp - walls_start                # (A, M, 2)
-        # in 2D, the magnitude of the cross product for vectors (a, b) is:
-        # |a_x * b_y - a_y * b_x|
-        cross = torch.abs(vec[:, :, 0] * wall_dirs[:, :, 1] - vec[:, :, 1] * wall_dirs[:, :, 0])  # (A, M)
-        
-        # distance from candidate to each wall:
-        distances = cross / norm_wall_dirs           # (A, M)
-
-        # a candidate is safe if its distance to every wall is at least (robot_radius + safety_margin)
-        safe_threshold = robot_radius + safety_margin
-        safe_mask = (distances >= safe_threshold).all(dim=1)  # (A,) True for candidates that are safe
-
-        # select the first safe candidate if any exist, otherwise return the last candidate.
-        safe_candidates = candidates[safe_mask]
-        if safe_candidates.shape[0] > 0:
-            return safe_candidates[0].tolist()
-        else:
-            return candidates[-1].tolist()
         
     def distance_from_line(self, point, start, end):
         # compute perpendicular distance from point to the line defined by start and end.
@@ -446,31 +458,64 @@ class Maze:
         return np.abs(np.cross(e-s, s-p)) / np.linalg.norm(e-s)
     
     def check_collision(self, pos, min_dist):
-        # compute the distances from each robot to walls
+        """
+        Compute the distances from each robot (given by their positions pos)
+        to each wall defined by its start and end points.
+        
+        Args:
+            pos (torch.Tensor): Robot positions, shape [num_envs, 2].
+            min_dist (float): Minimum allowed distance from the wall.
+            
+        Returns:
+            torch.Tensor: A tensor of shape [num_envs, num_walls] with the computed distances.
+                        (You can then choose how to aggregate these, e.g. taking the minimum.)
+        """
+        # Adjust the minimum distance by adding half the wall width if needed.
+        min_dist_adjusted = min_dist + self.width / 2.0
 
-        min_dist_adjusted = min_dist +self.width/2
-
-        walls_start = self.walls_start_tensor
-        walls_end = self.walls_end_tensor
-
-        wall_dirs = walls_end - walls_start
-        norm_wall_dirs = torch.norm(wall_dirs, dim=1)
-        norm_wall_dirs = torch.where(norm_wall_dirs == 0, torch.tensor(1e-6, device=pos.device), norm_wall_dirs)
-
-        pos_exp = pos.unsqueeze(1)
-        walls_start_exp = walls_start.unsqueeze(0)
-        wall_dirs_exp = wall_dirs.unsqueeze(0)
-        norm_wall_dirs_exp = norm_wall_dirs.unsqueeze(0)
-
-        vec = walls_start_exp - pos_exp
-        cross = torch.abs(wall_dirs_exp[:, :, 0] * vec[:, :, 1] - wall_dirs_exp[:, :, 1] * vec[:, :, 0])
-        dists_all = cross / norm_wall_dirs_exp
-
-        mask = dists_all < min_dist_adjusted
-        dists_masked = torch.where(mask, dists_all, torch.tensor(float('inf'), device=pos.device))
-
+        # walls_start_tensor and walls_end_tensor are assumed to have shape [num_walls, 2]
+        walls_start = self.walls_start_tensor  # shape: [num_walls, 2]
+        walls_end = self.walls_end_tensor      # shape: [num_walls, 2]
+        
+        # Compute wall direction vectors and their squared lengths
+        wall_dirs = walls_end - walls_start            # shape: [num_walls, 2]
+        norm_wall_dirs_sq = (wall_dirs ** 2).sum(dim=1)  # shape: [num_walls]
+        norm_wall_dirs_sq = torch.where(norm_wall_dirs_sq == 0, torch.tensor(1e-6, device=pos.device), norm_wall_dirs_sq)
+        
+        # Expand dimensions so that we can compute pairwise differences:
+        # pos: [num_envs, 2] -> [num_envs, 1, 2]
+        # walls_start: [num_walls, 2] -> [1, num_walls, 2]
+        pos_exp = pos.unsqueeze(1)              # shape: [num_envs, 1, 2]
+        walls_start_exp = walls_start.unsqueeze(0)  # shape: [1, num_walls, 2]
+        wall_dirs_exp = wall_dirs.unsqueeze(0)      # shape: [1, num_walls, 2]
+        
+        # Compute vector from wall start to each robot position
+        vec = pos_exp - walls_start_exp          # shape: [num_envs, num_walls, 2]
+        
+        # Compute the projection parameter t for each robot-wall pair:
+        # t = ((P - A) dot (B - A)) / ||B-A||^2
+        dot = (vec * wall_dirs_exp).sum(dim=2)     # shape: [num_envs, num_walls]
+        norm_sq = norm_wall_dirs_sq.unsqueeze(0)    # shape: [1, num_walls]
+        t = dot / norm_sq                          # shape: [num_envs, num_walls]
+        
+        # Clamp t to the range [0, 1] to ensure projection falls on the segment.
+        t_clamped = t.clamp(0.0, 1.0)                # shape: [num_envs, num_walls]
+        
+        # Compute the projection point for each robot-wall pair:
+        # projection = A + t_clamped * (B - A)
+        p_proj = walls_start_exp + t_clamped.unsqueeze(-1) * wall_dirs_exp  # shape: [num_envs, num_walls, 2]
+        
+        # Compute distance from each robot position to the projection point:
+        dists_seg = torch.norm(pos_exp - p_proj, dim=2)  # shape: [num_envs, num_walls]
+        
+        # Optionally, you can set distances above min_dist_adjusted to infinity, if you want to consider only walls that are "close"
+        dists_masked = torch.where(dists_seg < min_dist_adjusted, dists_seg, torch.tensor(float('inf'), device=pos.device))
+        
+        # You might want to return the smallest few distances for each environment:
         sorted_dists, _ = torch.sort(dists_masked, dim=1)
+        # For example, return the smallest 3 distances:
         smallest3 = sorted_dists[:, :3]
+        # Replace infinities with a flag value if needed (e.g., -1)
         smallest3 = torch.where(torch.isinf(smallest3), torch.tensor(-1.0, device=pos.device), smallest3)
         
         return smallest3

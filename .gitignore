@@ -29,3 +29,5 @@ VERSION
 .gitattributes
 rewards_log.npy
 source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/plot_rewards.ipynb
+log_runs.ods
+.~lock.log_runs.ods#
