@@ -14,7 +14,6 @@ there will be significant overhead in GPU->CPU transfer.
 
 import argparse
 import sys
-import matplotlib.pyplot as plt
 
 from isaaclab.app import AppLauncher
 
@@ -22,11 +21,12 @@ from isaaclab.app import AppLauncher
 parser = argparse.ArgumentParser(description="Train an RL agent with Stable-Baselines3.")
 parser.add_argument("--video", action="store_true", default=False, help="Record videos during training.")
 parser.add_argument("--video_length", type=int, default=500, help="Length of the recorded video (in steps).")
-parser.add_argument("--video_interval", type=int, default=1000000, help="Interval between video recordings (in steps).")
+parser.add_argument("--video_interval", type=int, default=100000, help="Interval between video recordings (in steps).")
 parser.add_argument("--num_envs", type=int, default=None, help="Number of environments to simulate.")
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument("--seed", type=int, default=None, help="Seed used for the environment")
 parser.add_argument("--max_iterations", type=int, default=None, help="RL Policy training iterations.")
+parser.add_argument("--load", type=str, default=None, help="Load a model from a file.")
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
 # parse the arguments
@@ -71,6 +71,27 @@ from isaaclab.utils.io import dump_pickle, dump_yaml
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils.hydra import hydra_task_config
 
+import csv
+
+
+class CustomCSVLogger:
+    def __init__(self):
+        log_dir = os.path.join(os.path.dirname(__file__), "logs")
+        os.makedirs(log_dir, exist_ok=True)
+
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        self.filename = os.path.join(log_dir, f"reward_log_{timestamp}.csv")
+
+        with open(self.filename, mode="w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["timestep", "dual", "mean_reward", "mean_cost", "total_reward"])
+    
+    def record(self, timestep: int, dual: float, mean_reward: float, mean_cost: float, total_reward: float) -> None:
+        with open(self.filename, mode="a", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow([timestep, dual, mean_reward, mean_cost, total_reward])
+
+
 
 
 # PPO wrapper for Lagrangian dual updates
@@ -90,7 +111,11 @@ class PPO_LagrangianWrapper:
         self.constraint_limit = constraint_limit
         self.alpha_lambda = alpha_lambda
         self.lambda_val = initial_lambda
-        self.dual_logger = [initial_lambda]
+        self.logger = CustomCSVLogger()
+        self.p2dratio = 1
+
+        self.env._set_dual_multiplier(self.lambda_val)
+        self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0)
 
     def update_dual(self):
         """
@@ -100,30 +125,29 @@ class PPO_LagrangianWrapper:
         constraint_cost = self.compute_total_constraint_cost()  # expected to be a scalar (float)
         # Dual update: increase lambda if constraint is violated, decrease otherwise.
         self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (constraint_cost - self.constraint_limit))
-        self.dual_logger.append(self.lambda_val)
         # Pass the updated dual multiplier to the environment (so it adjusts the reward function)
         self.env._set_dual_multiplier(self.lambda_val)
         print(f"Dual variable updated to {self.lambda_val:.4f}, constraint cost: {constraint_cost:.4f} with constraint limit: {self.constraint_limit:.4f}")
 
-    def learn(self, total_timesteps: int, chunk_timesteps: int = 5*131072, **kwargs):
+    def learn(self, callback, total_timesteps: int, base: int = 1310720, p2dratio: int=1, **kwargs):
         """
         Run training in chunks, updating the dual variable after each chunk.
         """
+        self.p2dratio = p2dratio
+        chunk_timesteps = base*p2dratio
         timesteps_so_far = 0
         while timesteps_so_far < total_timesteps:
             # Train PPO for a chunk of timesteps
-            self.ppo.learn(chunk_timesteps, reset_num_timesteps=False, **kwargs)
+            self.env._reset_reward_and_cost()
+            self.ppo.learn(chunk_timesteps, reset_num_timesteps=False, callback=callback, **kwargs)
             timesteps_so_far += chunk_timesteps
+            r, c  = self.env._get_reward_and_cost()
+            r = r.mean().item()
+            c = c.mean().item()
             # After each chunk, update the dual variable
             self.update_dual()
+            self.logger.record(timesteps_so_far, self.lambda_val, r, c, r - self.lambda_val * c)
             print(f"Training progress: {timesteps_so_far/total_timesteps*100:.2f}%")
-        
-        # plotting the dual variable
-        plt.plot(self.dual_logger)
-        plt.xlabel("Training Iterations")
-        plt.ylabel("Dual Variable")
-        plt.title("Dual Variable Update")
-        plt.show()
 
         return self.ppo
 
@@ -138,6 +162,7 @@ class PPO_LagrangianWrapper:
         Get the average constraint cost across all parallel environments.
         """
         constraint_costs = self.env._get_constraint_cost()  # Shape: (num_envs,)
+        constraint_costs = constraint_costs / self.p2dratio
         return constraint_costs.mean().item()  # Average over environments
 
 
@@ -188,6 +213,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     else:
         agent_cfg["learning_rate"] = learning_rate
 
+    num_envs = env_cfg.scene.num_envs
+    num_steps = agent_cfg["n_steps"]
+    base = num_envs * num_steps
+
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
 
@@ -224,7 +253,13 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
 
     # create agent from stable baselines
-    agent = PPO_LagrangianWrapper(PPO(policy_arch, env, verbose=1, **agent_cfg), env, constraint_limit=1.0, alpha_lambda=0.001)
+    if args_cli.load is None:
+        agent = PPO_LagrangianWrapper(PPO(policy_arch, env, verbose=1, **agent_cfg), env, constraint_limit=1.0, alpha_lambda=1e-4)
+    else:
+        model = PPO.load(args_cli.load, env=env, verbose=1, **agent_cfg)
+        model.learning_rate = 1e-4
+        print("Learning rate: ", model.learning_rate)
+        agent = PPO_LagrangianWrapper(model, env, constraint_limit=0.0, alpha_lambda=1e-4)
     # agent = PPO(policy_arch, env, verbose=1, **agent_cfg)
     # configure the logger
     new_logger = configure(log_dir, ["stdout", "tensorboard"])
@@ -234,7 +269,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # callbacks for agent
     checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=log_dir, name_prefix="model", verbose=2)
     # train the agent
-    agent.learn(total_timesteps=n_timesteps, callback=checkpoint_callback)
+    agent.learn(total_timesteps=n_timesteps, base=base, p2dratio=5, callback=checkpoint_callback)
     # save the final model
     agent.save(os.path.join(log_dir, "model"))
 

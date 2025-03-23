@@ -1,7 +1,7 @@
 # Reference: https://github.com/DLR-RM/rl-baselines3-zoo/blob/master/hyperparams/ppo.yml#L32
 seed: 42
 
-n_timesteps: !!float 20e6
+n_timesteps: !!float 5e7
 policy: 'MlpPolicy'
 n_steps: 32 #4096 # The number of steps to run for each environment per update 
                     # (i.e. rollout buffer size is n_steps * n_envs where n_envs is number of environment copies running in parallel) 
@@ -10,8 +10,8 @@ gae_lambda: 0.95
 gamma: 0.99
 n_epochs: 5 #20 # Number of epoch when optimizing the surrogate loss
 ent_coef: 0.02
-learning_rate: !!float 3e-4
-decaying_learning_rate: !!bool true
+learning_rate: !!float 1e-4
+decaying_learning_rate: !!bool false
 clip_range: !!float 0.2
 policy_kwargs: "dict(
                   activation_fn=nn.ReLU,

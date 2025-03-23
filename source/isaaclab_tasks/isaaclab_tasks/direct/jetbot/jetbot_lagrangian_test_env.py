@@ -17,14 +17,17 @@ from isaaclab.utils import configclass
 
 import yaml
 import os
+import csv
+from datetime import datetime
 import random
+import numpy as np
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 1
     episode_length_s = 20.0
-    action_scale = 10.0
+    action_scale = 1.0
     action_space = 2
     observation_space = 10 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y, 3*distance_to_obstacle
     state_space = 0
@@ -43,18 +46,19 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
     
     # reset
-    max_distance_from_goal = 8.0 # jetbot moved too far from goal
-    initial_pose_min_distance = 2.5  # the minimum distance from the goal
-    initial_pose_radius = 6.0  # the radius around goal in which the jetbot initial position is sampled
+    max_distance_from_goal = 7.0 # jetbot moved too far from goal
+    initial_pose_min_distance = 2.8  # the minimum distance from the goal
+    initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
+
+    wall_width = 0.8
 
     # reward scales
-    rew_scale_goal = 40.0 # reward for reaching the goal
-    rew_scale_distance = 15.0 # reward for moving towards the goal
+    rew_scale_goal = 30.0 # reward for reaching the goal
+    rew_scale_distance = 40.0 # reward for moving towards the goal
     rew_scale_terminated = -50.0 # penalty for termination
 
-    cost_obstacle_slope = -70.0
-    cost_obstacle_intercept = 20.0
-    min_dist_to_obstacle = 0.18
+    cost_obstacle = 1.0
+    min_dist_to_obstacle = 0.1
 
     # goal
     goal_pos = [0.0, 0.0]
@@ -93,8 +97,20 @@ class JetBotEnv(DirectRLEnv):
             except yaml.YAMLError as exc:
                 self.gamma = 0.99
 
-        self.dual_multiplier = 1.0
-        self._computed_constraint_cost = None
+        self.dual_multiplier = 0.0
+
+        # --------------------------------------------------------------------------------------------------------------
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        # --------------------------------------------------------------------------------------------------------------
+        self.n_envs = 16
+        self.n_steps = 32
+        # --------------------------------------------------------------------------------------------------------------
+        # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+        # --------------------------------------------------------------------------------------------------------------
+
+        # logging
+        self.episode_rewards = torch.zeros(self.n_envs, device=self.device)
+        self.episode_costs = torch.zeros(self.n_envs, device=self.device)
 
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
@@ -137,7 +153,7 @@ class JetBotEnv(DirectRLEnv):
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
-        self.maze.spawn_maze()
+        self.maze.spawn_maze(width=self.cfg.wall_width)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = self.action_scale * actions.clone()
@@ -158,7 +174,7 @@ class JetBotEnv(DirectRLEnv):
         pos = self.jetbot.data.root_pos_w[:, :2]
         #print("Robot pos: ", pos)
 
-        dist_to_obs = self.maze.check_collision(pos, self.cfg.min_dist_to_obstacle)
+        dist_to_obs = self.maze.check_collision(pos)
 
         # orientation: compute yaw from the root orientation
         orient = self.jetbot.data.root_quat_w
@@ -209,12 +225,12 @@ class JetBotEnv(DirectRLEnv):
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
 
-        dist_to_obs = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2], self.cfg.min_dist_to_obstacle)
+        dist_to_obs = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2])
         #print("Distance to obstacles: ", dist_to_obs)
 
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
-        goal_r, term_r, dist_r, primary_reward, dist = compute_rewards(
+        primary_reward, dist = compute_rewards(
             self.cfg.rew_scale_terminated,
             self.cfg.rew_scale_goal,
             self.cfg.rew_scale_distance,
@@ -225,19 +241,21 @@ class JetBotEnv(DirectRLEnv):
             self.episode_length_buf,
             self.gamma
         )
-        print("Primary reward: ", primary_reward)
 
         self.prec_dist = dist
 
         constraint_cost = compute_cost(
-            self.cfg.cost_obstacle_slope,
-            self.cfg.cost_obstacle_intercept,
+            self.cfg.cost_obstacle,
+            self.cfg.min_dist_to_obstacle + self.cfg.wall_width / 2.0,
             dist_to_obs,
         )
         self._computed_constraint_cost = constraint_cost
-        print("Constraint cost: ", constraint_cost)
+
+        self.episode_rewards += primary_reward
+        self.episode_costs += constraint_cost
 
         return primary_reward - self.dual_multiplier * constraint_cost
+        #return primary_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # check if the episode has run out of time
@@ -312,7 +330,14 @@ class JetBotEnv(DirectRLEnv):
         self.dual_multiplier = value
 
     def _get_constraint_cost(self):
-        return self._computed_constraint_cost
+        return self.episode_costs
+    
+    def _reset_reward_and_cost(self):
+        self.episode_rewards = torch.zeros(self.n_envs, device=self.device)
+        self.episode_costs = torch.zeros(self.n_envs, device=self.device)
+    
+    def _get_reward_and_cost(self):
+        return self.episode_rewards, self.episode_costs
 
 
 # decorator to compile the function to TorchScript
@@ -331,17 +356,14 @@ def compute_rewards(
     gamma: float
 ):
     # compute the distance to the goal
-    dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1)
+    dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1) 
 
     # compute the rewards
     terminated = (dist_to_goal >= max_distance_from_goal).float()
     rew_termination = rew_scale_terminated * terminated
-    #rew_alive = rew_scale_alive * (1.0 - terminated)
 
     rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
-    #rew_goal = 200 - episode_length_buf/10
 
-    #rew_distance = 10 - math.exp(rew_scale_distance * dist_to_goal)
     rew_distance = torch.where(
         (prec_dist == 0.0) | torch.isclose(prec_dist - dist_to_goal, torch.tensor(0.0, device=prec_dist.device), atol=1e-6), 
         torch.zeros_like(dist_to_goal), 
@@ -350,24 +372,19 @@ def compute_rewards(
 
     rew_distance = rew_scale_distance * rew_distance
 
-    #rew_time = rew_scale_time * episode_length_buf
+    total_reward = rew_termination + rew_goal + rew_distance #- 0.1 * (episode_length_buf >= 1000).float()
 
-
-    total_reward = rew_termination + rew_goal + rew_distance
-    #total_reward = rew_distance
-    #print("Total reward: ", total_reward)
-    return rew_goal, rew_termination, rew_distance, total_reward, dist_to_goal
+    return total_reward, dist_to_goal
 
 @torch.jit.script
 def compute_cost(
-    cost_obstacle_slope: float,
-    cost_obstacle_intercept: float,
+    cost_obstacle: float,
+    min_dist: float,
     dist_to_obs: torch.Tensor,
 ):
     
-    cost_obstacles = torch.where(dist_to_obs >= 0.0, cost_obstacle_slope*dist_to_obs + cost_obstacle_intercept, torch.tensor(0.0)).sum(dim=1)
+    cost_obstacles = torch.where(dist_to_obs <= min_dist, cost_obstacle*(1 - dist_to_obs/min_dist), torch.tensor(0.0)).sum(dim=1)
     return cost_obstacles
-
 
 
 
@@ -457,7 +474,7 @@ class Maze:
             return np.linalg.norm(p - s)
         return np.abs(np.cross(e-s, s-p)) / np.linalg.norm(e-s)
     
-    def check_collision(self, pos, min_dist):
+    def check_collision(self, pos):
         """
         Compute the distances from each robot (given by their positions pos)
         to each wall defined by its start and end points.
@@ -471,7 +488,7 @@ class Maze:
                         (You can then choose how to aggregate these, e.g. taking the minimum.)
         """
         # Adjust the minimum distance by adding half the wall width if needed.
-        min_dist_adjusted = min_dist + self.width / 2.0
+        #min_dist_adjusted = min_dist + self.width / 2.0
 
         # walls_start_tensor and walls_end_tensor are assumed to have shape [num_walls, 2]
         walls_start = self.walls_start_tensor  # shape: [num_walls, 2]
@@ -488,7 +505,8 @@ class Maze:
         pos_exp = pos.unsqueeze(1)              # shape: [num_envs, 1, 2]
         walls_start_exp = walls_start.unsqueeze(0)  # shape: [1, num_walls, 2]
         wall_dirs_exp = wall_dirs.unsqueeze(0)      # shape: [1, num_walls, 2]
-        
+        walls_end_exp = walls_end.unsqueeze(0)      # shape: [1, num_walls, 2]
+
         # Compute vector from wall start to each robot position
         vec = pos_exp - walls_start_exp          # shape: [num_envs, num_walls, 2]
         
@@ -498,26 +516,42 @@ class Maze:
         norm_sq = norm_wall_dirs_sq.unsqueeze(0)    # shape: [1, num_walls]
         t = dot / norm_sq                          # shape: [num_envs, num_walls]
         
-        # Clamp t to the range [0, 1] to ensure projection falls on the segment.
-        t_clamped = t.clamp(0.0, 1.0)                # shape: [num_envs, num_walls]
+        # Compute the projection point on the infinite line: P_proj = A + t*(B-A)
+        p_proj = walls_start_exp + t.unsqueeze(-1) * wall_dirs_exp  # shape: [num_envs, num_walls, 2]
+    
+        # Compute perpendicular distance (d_perp) to the infinite line
+        d_perp = torch.norm(pos_exp - p_proj, dim=2)           # shape: [num_envs, num_walls]
+
+        # --- Case 1: When projection falls on the segment (0 <= t <= 1) ---
+        mask_inside = (t >= 0.0) & (t <= 1.0)  # shape: [num_envs, num_walls]
+        d_on_segment = torch.clamp(d_perp - self.width/2.0, min=0.0)  # adjusted distance when on segment
+
+        # --- Case 2: When projection falls outside the segment (t < 0 or t > 1) ---
+        mask_outside = ~mask_inside
+
+        # For outside cases, determine the closest endpoint.
+        # For t < 0, use walls_start; for t > 1, use walls_end.
+        # Compute distance from projection to A and B.
+        d_ep_A = torch.norm(p_proj - walls_start_exp, dim=2)  # distance from projection to start, shape: [num_envs, num_walls]
+        d_ep_B = torch.norm(p_proj - walls_end_exp, dim=2)      # distance from projection to end, shape: [num_envs, num_walls]
+        # Choose the correct endpoint distance based on t.
+        d_ep = torch.where(t < 0, d_ep_A, d_ep_B)  # shape: [num_envs, num_walls]
         
-        # Compute the projection point for each robot-wall pair:
-        # projection = A + t_clamped * (B - A)
-        p_proj = walls_start_exp + t_clamped.unsqueeze(-1) * wall_dirs_exp  # shape: [num_envs, num_walls, 2]
+        # Now, for outside cases, further decide:
+        # If d_perp < w/2, robot is "beside" the wall; use d_ep.
+        # Else, robot is near a corner; use corner distance computed as:
+        # d_corner = sqrt( d_ep^2 + (d_perp - w/2)^2 ).
+        corner_distance = torch.sqrt(d_ep**2 + (d_perp - self.width/2.0)**2)
+        # Choose: if d_perp < w/2, then use d_ep; else, use corner_distance.
+        d_outside = torch.where(d_perp < self.width/2.0, d_ep, corner_distance)
+
+        # For outside, use d_outside; for inside, use d_on_segment.
+        final_dists = torch.where(mask_inside, d_on_segment, d_outside)  # shape: [num_envs, num_walls]
         
-        # Compute distance from each robot position to the projection point:
-        dists_seg = torch.norm(pos_exp - p_proj, dim=2)  # shape: [num_envs, num_walls]
-        
-        # Optionally, you can set distances above min_dist_adjusted to infinity, if you want to consider only walls that are "close"
-        dists_masked = torch.where(dists_seg < min_dist_adjusted, dists_seg, torch.tensor(float('inf'), device=pos.device))
-        
-        # You might want to return the smallest few distances for each environment:
-        sorted_dists, _ = torch.sort(dists_masked, dim=1)
-        # For example, return the smallest 3 distances:
+        # Optionally sort and return the smallest few distances.
+        sorted_dists, _ = torch.sort(final_dists, dim=1)
         smallest3 = sorted_dists[:, :3]
-        # Replace infinities with a flag value if needed (e.g., -1)
-        smallest3 = torch.where(torch.isinf(smallest3), torch.tensor(-1.0, device=pos.device), smallest3)
-        
+
         return smallest3
 
 def direct_diff_drive(v, omega, L, r):
@@ -539,3 +573,4 @@ def inverse_diff_drive(w_left, w_right, L, r):
     omega = (r / L) * (w_right - w_left)
 
     return v, omega
+

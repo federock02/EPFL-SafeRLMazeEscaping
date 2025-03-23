@@ -23,7 +23,7 @@ import numpy as np
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
     decimation = 1
-    episode_length_s = 30.0
+    episode_length_s = 20.0
     action_scale = 1.0  # TODO
     # 2 wheel control
     action_space = 2
@@ -49,7 +49,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
 
     # reward scales
-    rew_scale_goal = 50.0 # reward for reaching the goal
+    rew_scale_goal = 30.0 # reward for reaching the goal
 
     rew_scale_distance_delta = 30.0 # reward for moving towards the goal
     rew_scale_distance_exp = 0.3 # reward for moving towards the goal
@@ -238,6 +238,7 @@ class JetBotEnv(DirectRLEnv):
             self.gamma
         )
 
+        """
         goal_rew_mean = goal_r.mean().item()
         goal_rew_std = goal_r.std().item()
         termination_rew_mean = term_r.mean().item()
@@ -251,7 +252,8 @@ class JetBotEnv(DirectRLEnv):
         log_rewards_to_npy(goal_rew_mean, goal_rew_std,
                             termination_rew_mean, termination_rew_std,
                             distance_rew_mean, distance_rew_std,
-                            total_rew_mean, total_rew_std)
+                            total_rew_mean, total_rew_std)"
+        """
 
         self.prec_dist = dist
         return total_reward

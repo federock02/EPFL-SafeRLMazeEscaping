@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [192, 64]
+        layers: [192, 128]
         activations: relu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [192, 64]
+        layers: [192, 128]
         activations: relu
     output: ONE
 
@@ -76,5 +76,5 @@ agent:
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 4800
+  timesteps: 300
   environment_info: log
