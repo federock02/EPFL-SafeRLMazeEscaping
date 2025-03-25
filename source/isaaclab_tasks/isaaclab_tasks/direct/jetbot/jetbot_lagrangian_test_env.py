@@ -52,14 +52,6 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
     wall_width = 0.8
 
-    # reward scales
-    rew_scale_goal = 30.0 # reward for reaching the goal
-    rew_scale_distance = 40.0 # reward for moving towards the goal
-    rew_scale_terminated = -50.0 # penalty for termination
-
-    cost_obstacle = 1.0
-    min_dist_to_obstacle = 0.1
-
     # goal
     goal_pos = [0.0, 0.0]
 
@@ -69,6 +61,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     # robot geometry
     wheelbase = 0.12
     wheelradius = 0.032
+
 
 class JetBotEnv(DirectRLEnv):
     cfg: JetBotEnvCfg
@@ -90,12 +83,31 @@ class JetBotEnv(DirectRLEnv):
         self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
 
         # gamma for reward computation
-        config_path = os.path.join(os.path.dirname(__file__), "agents", "sb3_ppo_cfg.yaml")
+        config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_lagrangian_cfg.yaml")
+        print("Config path: ", config_path)
         with open(config_path) as stream:
             try:
-                self.gamma = yaml.safe_load(stream)["gamma"]
+                data = yaml.safe_load(stream)
+                self.gamma = data["agent"]["discount_factor"]
+                self.rew_scale_goal = data["rewards"]["goal"]
+                self.rew_scale_distance = data["rewards"]["distance"]
+                self.rew_scale_terminated = data["rewards"]["termination"]
+                self.cost_obstacle = data["costs"]["obstacle"]
+                self.min_dist_to_obstacle = data["min_dist"]
             except yaml.YAMLError as exc:
                 self.gamma = 0.99
+                self.rew_scale_goal = 30.0
+                self.rew_scale_distance = 50.0
+                self.rew_scale_terminated = -80.0
+                self.cost_obstacle = 1.0
+                self.min_dist_to_obstacle = 0.18
+        
+        print("Gamma: ", self.gamma)
+        print("Rew scale goal: ", self.rew_scale_goal)
+        print("Rew scale distance: ", self.rew_scale_distance)
+        print("Rew scale terminated: ", self.rew_scale_terminated)
+        print("Cost obstacle: ", self.cost_obstacle)
+        print("Min dist to obstacle: ", self.min_dist_to_obstacle)
 
         self.dual_multiplier = 0.0
 
@@ -103,7 +115,6 @@ class JetBotEnv(DirectRLEnv):
         # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # --------------------------------------------------------------------------------------------------------------
         self.n_envs = 16
-        self.n_steps = 32
         # --------------------------------------------------------------------------------------------------------------
         # ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
         # --------------------------------------------------------------------------------------------------------------
@@ -231,9 +242,9 @@ class JetBotEnv(DirectRLEnv):
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
         primary_reward, dist = compute_rewards(
-            self.cfg.rew_scale_terminated,
-            self.cfg.rew_scale_goal,
-            self.cfg.rew_scale_distance,
+            self.rew_scale_terminated,
+            self.rew_scale_goal,
+            self.rew_scale_distance,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
             self.cfg.max_distance_from_goal, # max distance from goal, for termination
@@ -245,8 +256,8 @@ class JetBotEnv(DirectRLEnv):
         self.prec_dist = dist
 
         constraint_cost = compute_cost(
-            self.cfg.cost_obstacle,
-            self.cfg.min_dist_to_obstacle + self.cfg.wall_width / 2.0,
+            self.cost_obstacle,
+            self.min_dist_to_obstacle + self.cfg.wall_width / 2.0,
             dist_to_obs,
         )
         self._computed_constraint_cost = constraint_cost
@@ -338,6 +349,9 @@ class JetBotEnv(DirectRLEnv):
     
     def _get_reward_and_cost(self):
         return self.episode_rewards, self.episode_costs
+    
+    def _set_num_envs(self, num_envs):
+        self.n_envs = num_envs
 
 
 # decorator to compile the function to TorchScript
@@ -547,10 +561,14 @@ class Maze:
 
         # For outside, use d_outside; for inside, use d_on_segment.
         final_dists = torch.where(mask_inside, d_on_segment, d_outside)  # shape: [num_envs, num_walls]
+
+        #capped_dist = torch.where(final_dists <= 0.4, final_dists, torch.tensor(0.4, device=final_dists.device))
         
         # Optionally sort and return the smallest few distances.
         sorted_dists, _ = torch.sort(final_dists, dim=1)
+        #sorted_dists, _ = torch.sort(capped_dist, dim=1)
         smallest3 = sorted_dists[:, :3]
+        print("Distances: ", smallest3)
 
         return smallest3
 

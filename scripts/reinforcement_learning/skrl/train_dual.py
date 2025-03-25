@@ -136,7 +136,7 @@ def get_unwrapped_env(env):
 # This wrapper is used to train a PPO agent with a constraint cost in the environment
 # The constraint cost is used to update a Lagrange multiplier (dual variable) that adjusts the reward function
 class PPO_LagrangianWrapper:
-    def __init__(self, runner, constraint_limit: float, alpha_lambda: float, initial_lambda: float = 1.0):
+    def __init__(self, runner, constraint_limit: float = 0.0, alpha_lambda: float = 1.0e-4, initial_lambda: float = 1.0):
         """
         runner: an instance of skrl Runner, which encapsulates the agent and environment.
         constraint_limit: the acceptable threshold for the constraint cost.
@@ -150,7 +150,7 @@ class PPO_LagrangianWrapper:
         self.lambda_val = initial_lambda  # dual variable
         self.logger = CustomCSVLogger()  # Initialize a custom CSV logger
         self.total_timesteps_run = 0
-        self.chunk = 1000
+        self.chunk = None
 
         # Set the dual multiplier in the environment so that the reward function uses it
         self.env._set_dual_multiplier(self.lambda_val)
@@ -181,9 +181,9 @@ class PPO_LagrangianWrapper:
         Run training in chunks, updating the dual variable after each chunk.
         """
         self.chunk = chunk_timesteps
+        print(f"Chunk timesteps: {self.chunk}")
         while self.total_timesteps_run < total_timesteps:
 
-            self.runner._cfg["timesteps"] = chunk_timesteps
             # reset reward and cost accumulators
             self.env._reset_reward_and_cost()
 
@@ -266,6 +266,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
+    
+    get_unwrapped_env(env)._set_num_envs(args_cli.num_envs)
 
     # wrap for video recording
     if args_cli.video:
@@ -292,18 +294,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
 
+    c_limit = agent_cfg["lagrangian"]["cost_limit"]
+    print(f"[INFO] Constraint limit: {c_limit}")
+    lr_lambda = agent_cfg["lagrangian"]["learning_rate_lambda"]
+    print(f"[INFO] Learning rate for dual update: {lr_lambda}")
+    init_l = agent_cfg["lagrangian"]["initial_lambda"]
+    print(f"[INFO] Initial value for dual variable: {init_l}")
     # wrap the Runner with PPO-Lagrangian wrapper
-    lagrangian_agent = PPO_LagrangianWrapper(runner, constraint_limit=0.0, alpha_lambda=5.0e-4)
+    lagrangian_agent = PPO_LagrangianWrapper(runner, constraint_limit=c_limit, alpha_lambda=lr_lambda, initial_lambda=init_l)
     print("[INFO] PPO-Lagrangian wrapper created.")
 
+    chunk_timesteps = agent_cfg["trainer"]["timesteps"]
+    total_timesteps = agent_cfg["trainer"]["total_timesteps"]
+    print(f"[INFO] Running training with {total_timesteps} timesteps in chunks of {chunk_timesteps} timesteps")
+    init_time = datetime.now()
     # Run training with the wrapper for a total number of timesteps
-    runner_trained = lagrangian_agent.run(total_timesteps=500, chunk_timesteps=300)
+    runner_trained = lagrangian_agent.run(total_timesteps=total_timesteps, chunk_timesteps=chunk_timesteps)
 
     # Optionally, save the final model
     save_path = os.path.join(log_dir, "final_model.zip")
     print(f"[INFO] Saving final model to: {save_path}")
     #runner.agent.save(os.path.join(agent_cfg["agent"]["experiment"]["experiment_name"], "final_model.zip"))
     runner_trained.agent.save(save_path)
+    print(f"[INFO] Training completed in {datetime.now() - init_time}")
 
     # close the simulator
     env.close()

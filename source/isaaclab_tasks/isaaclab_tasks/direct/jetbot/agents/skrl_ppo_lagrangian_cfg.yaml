@@ -71,11 +71,26 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
 
+# Lagrangian configuration
+lagrangian:
+  initial_lambda: 1.0
+  cost_limit: 0.01
+  learning_rate_lambda: 5.0e-4
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 30000
+  timesteps: 300
   environment_info: log
+  total_timesteps: 30000
+
+# Environment configuration
+rewards:
+  goal: 30
+  distance: 50
+  termination: -80
+costs:
+  obstacle: 1
+min_dist: 0.11
 

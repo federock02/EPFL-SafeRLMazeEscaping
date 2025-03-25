@@ -94,6 +94,13 @@ from isaaclab_tasks.utils import get_checkpoint_path, load_cfg_from_registry, pa
 # config shortcuts
 algorithm = args_cli.algorithm.lower()
 
+def get_unwrapped_env(env):
+    """
+    Iteratively unwrap the environment until you reach the base environment.
+    """
+    while hasattr(env, "env") or hasattr(env, "venv"):
+        env = getattr(env, "env", getattr(env, "venv", env))
+    return env
 
 def main():
     """Play with skrl agent."""
@@ -134,6 +141,8 @@ def main():
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
+
+    get_unwrapped_env(env)._set_num_envs(args_cli.num_envs)
 
     # get environment (physics) dt for real-time evaluation
     try:
