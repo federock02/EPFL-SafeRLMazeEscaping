@@ -136,16 +136,16 @@ def get_unwrapped_env(env):
 # This wrapper is used to train a PPO agent with a constraint cost in the environment
 # The constraint cost is used to update a Lagrange multiplier (dual variable) that adjusts the reward function
 class PPO_LagrangianWrapper:
-    def __init__(self, runner, constraint_limit: float = 0.0, alpha_lambda: float = 1.0e-4, initial_lambda: float = 1.0):
+    def __init__(self, runner, min_safety: float = 0.0, alpha_lambda: float = 1.0e-4, initial_lambda: float = 1.0):
         """
         runner: an instance of skrl Runner, which encapsulates the agent and environment.
-        constraint_limit: the acceptable threshold for the constraint cost.
+        min_safety: the acceptable minimum threshold for the safety probability.
         alpha_lambda: learning rate for the dual update.
         initial_lambda: starting value for the Lagrange multiplier.
         """
         self.runner = runner
         self.env = get_unwrapped_env(runner._env)
-        self.constraint_limit = constraint_limit
+        self.min_safety = min_safety
         self.alpha_lambda = alpha_lambda
         self.lambda_val = initial_lambda  # dual variable
         self.logger = CustomCSVLogger()  # Initialize a custom CSV logger
@@ -156,25 +156,16 @@ class PPO_LagrangianWrapper:
         self.env._set_dual_multiplier(self.lambda_val)
         self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0, 0.0)
 
-    def compute_total_constraint_cost(self) -> float:
-        """
-        Compute the average constraint cost over all environments.
-        Assumes that _get_constraint_cost() returns a tensor of shape [num_envs, 1].
-        """
-        constraint_costs = self.env._get_constraint_cost()  # shape: (num_envs, 1)
-        constraint_costs = constraint_costs / self.chunk
-        return constraint_costs.mean().item()
-
     def update_dual(self):
         """
         Update the dual variable (Lagrange multiplier) based on the current constraint cost.
         """
-        constraint_cost = self.env._get_constraint_cost().mean().item()
+        safety_prob = self.env._get_safety_probability().item()
         # Dual update (gradient ascent) with projection onto non-negative values:
-        self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (constraint_cost - self.constraint_limit))
+        self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (self.min_safety - safety_prob))
         # Update the environment with the new dual value:
         self.env._set_dual_multiplier(self.lambda_val)
-        print(f"Dual updated: {self.lambda_val:.4f} (constraint cost: {constraint_cost:.4f}, limit: {self.constraint_limit:.4f})")
+        print(f"Dual updated: {self.lambda_val:.4f} (safety probability: {safety_prob:.4f}, minimum: {self.min_safety:.4f})")
 
     def run(self, total_timesteps: int, chunk_timesteps: int):
         """
@@ -298,14 +289,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print(f"[INFO] Loading model checkpoint from: {resume_path}")
         runner.agent.load(resume_path)
 
-    c_limit = agent_cfg["lagrangian"]["cost_limit"]
-    print(f"[INFO] Constraint limit: {c_limit}")
+    min_safety = agent_cfg["lagrangian"]["min_safety_probability"]
+    print(f"[INFO] Minimum safety probability limit: {min_safety}")
     lr_lambda = agent_cfg["lagrangian"]["learning_rate_lambda"]
     print(f"[INFO] Learning rate for dual update: {lr_lambda}")
     init_l = agent_cfg["lagrangian"]["initial_lambda"]
     print(f"[INFO] Initial value for dual variable: {init_l}")
     # wrap the Runner with PPO-Lagrangian wrapper
-    lagrangian_agent = PPO_LagrangianWrapper(runner, constraint_limit=c_limit, alpha_lambda=lr_lambda, initial_lambda=init_l)
+    lagrangian_agent = PPO_LagrangianWrapper(runner, min_safety=min_safety, alpha_lambda=lr_lambda, initial_lambda=init_l)
     print("[INFO] PPO-Lagrangian wrapper created.")
 
     chunk_timesteps = agent_cfg["trainer"]["timesteps"]
