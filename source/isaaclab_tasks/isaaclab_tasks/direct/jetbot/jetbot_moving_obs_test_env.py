@@ -8,12 +8,13 @@ from collections.abc import Sequence
 from isaaclab_assets.robots.jetbot import JETBOT_CFG
 
 import isaaclab.sim as sim_utils
-from isaaclab.assets import Articulation, ArticulationCfg
+from isaaclab.assets import Articulation, ArticulationCfg, RigidObject, RigidObjectCfg
 from isaaclab.envs import DirectRLEnv, DirectRLEnvCfg
 from isaaclab.scene import InteractiveSceneCfg
 from isaaclab.sim import SimulationCfg
 from isaaclab.sim.spawners.from_files import GroundPlaneCfg, spawn_ground_plane
 from isaaclab.utils import configclass
+import isaacsim.core.utils.prims as prim_utils
 
 import yaml
 import os
@@ -21,38 +22,6 @@ import csv
 from datetime import datetime
 import random
 import numpy as np
-
-import csv
-
-
-class CustomCSVLogger:
-    def __init__(self):
-        log_dir = os.path.join(os.path.dirname(__file__), "logs")
-        os.makedirs(log_dir, exist_ok=True)
-
-        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        self.filename = os.path.join(log_dir, f"iter_reward_log_{timestamp}.csv")
-
-        with open(self.filename, mode="w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["dual", "dist_rewards", "dr_std", "goal_reward", "gr_std", "term_reward", "tr_std", 
-                             "mean_reward", "std_reward", "mean_cost", "std_cost", "total_reward", "safety_prob"])
-
-    def record(self, dual: float, dist_reward: float, dist_std: float, goal_reward: float, goal_std: float, 
-               term_reward: float, term_std: float, mean_reward: float, std_reward: float, mean_cost: float, 
-               std_cost: float, total_reward: float, safety_prob: float) -> None:
-        with open(self.filename, mode="a", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([dual, dist_reward, dist_std, goal_reward, goal_std, term_reward, term_std, 
-                             mean_reward, std_reward, mean_cost, std_cost, total_reward, safety_prob])
-
-def get_unwrapped_env(env):
-    """
-    Iteratively unwrap the environment until you reach the base environment.
-    """
-    while hasattr(env, "env") or hasattr(env, "venv"):
-        env = getattr(env, "env", getattr(env, "venv", env))
-    return env
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
@@ -152,8 +121,6 @@ class JetBotEnv(DirectRLEnv):
         self.last_episode_costs = torch.zeros(self.n_envs, device=self.device)
         self.safety_indicator = torch.ones(self.n_envs, device=self.device)
 
-        self.logger = CustomCSVLogger()
-
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
 
@@ -169,7 +136,26 @@ class JetBotEnv(DirectRLEnv):
         )
         cfg_goal_cube.func(f"/World/Objects/goal", cfg_goal_cube, translation=tuple(goal_pos))
 
-                # add spawn area and bound are circles
+        # add a cube as an obstacle
+        origins = [[3.0, 3.0, 0.1],]
+        for i, origin in enumerate(origins):
+            prim_utils.create_prim(f"/World/Origin{i}", "Xform", translation=origin)
+
+        cube_cfg = RigidObjectCfg(
+            prim_path="/World/Origin.*/Cube",
+            spawn=sim_utils.CuboidCfg(
+                size=(0.2, 0.2, 0.2),
+                rigid_props=sim_utils.RigidBodyPropertiesCfg(),
+                mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+                collision_props=None,
+                visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 1.0, 1.0), metallic=0.2),
+            ),
+            init_state=RigidObjectCfg.InitialStateCfg(),
+        )
+
+        self.cube_object = RigidObject(cfg=cube_cfg)
+
+        # add spawn area and bound are circles
         spawn_area_color = (0.1, 0.8, 0.1)  # green
         bound_area_color = (0.8, 0.1, 0.1)  # red
         
@@ -276,14 +262,14 @@ class JetBotEnv(DirectRLEnv):
 
         # compute rewards
         # combination of reaching the goal, moving towards the goal, and penalizing termination
-        dist_r, goal_r, term_r, primary_reward, dist = compute_rewards(
+        primary_reward, dist = compute_rewards(
             self.rew_scale_terminated,
             self.rew_scale_goal,
             self.rew_scale_distance,
             self.rew_scale_time,
             self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
             self.cfg.goal_pos[:2], # shape [1, 2] # goal position
-            self.cfg.initial_pose_radius, # max distance from goal, for distance penalty
+            self.cfg.max_distance_from_goal, # max distance from goal, for termination
             self.prec_dist,
             self.episode_length_buf,
             self.gamma
@@ -301,23 +287,6 @@ class JetBotEnv(DirectRLEnv):
         self.episode_rewards += primary_reward
         self.episode_costs += constraint_cost
         self.last_episode_costs = constraint_cost
-
-        mean_d_r = dist_r.mean().item()
-        mean_g_r = goal_r.mean().item()
-        mean_t_r = term_r.mean().item()
-        std_d_r = dist_r.std().item()
-        std_g_r = goal_r.std().item()
-        std_t_r = term_r.std().item()
-
-        mean_r = primary_reward.mean().item()
-        std_r = primary_reward.std().item()
-        mean_c = constraint_cost.mean().item()
-        std_c = constraint_cost.std().item()
-
-        safety_prob = self._get_safety_probability().item()
-
-        self.logger.record(self.dual_multiplier, mean_d_r, std_d_r, mean_g_r, std_g_r, mean_t_r, std_t_r,
-                           mean_r, std_r, mean_c, std_c, mean_r - self.dual_multiplier*mean_c, safety_prob)
 
         return primary_reward - self.dual_multiplier * constraint_cost
         #return primary_reward
@@ -397,8 +366,7 @@ class JetBotEnv(DirectRLEnv):
         self.dual_multiplier = value
 
     def _get_constraint_cost(self):
-        # return self.last_episode_costs
-        return self.episode_costs
+        return self.last_episode_costs
     
     def _get_safety_probability(self):
         return torch.mean(self.safety_indicator)
@@ -430,7 +398,7 @@ def compute_rewards(
     rew_scale_time: float | None,
     robot_pos: torch.Tensor,
     goal_pos: list[float],
-    initial_pose_radius: float,
+    max_distance_from_goal: float,
     prec_dist: torch.Tensor,
     episode_length_buf: torch.Tensor,
     gamma: float
@@ -439,10 +407,10 @@ def compute_rewards(
     dist_to_goal = torch.norm(robot_pos - torch.tensor(goal_pos, device=robot_pos.device), dim=1) 
 
     # compute the rewards
-    terminated = (dist_to_goal >= initial_pose_radius).float()
+    terminated = (dist_to_goal >= max_distance_from_goal).float()
     rew_termination = rew_scale_terminated * terminated
 
-    rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() #* (gamma ** episode_length_buf)/(1.0 - gamma)
+    rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() * (gamma ** episode_length_buf)/(1.0 - gamma)
 
     rew_distance = torch.where(
         (prec_dist == 0.0) | torch.isclose(prec_dist - dist_to_goal, torch.tensor(0.0, device=prec_dist.device), atol=1e-6), 
@@ -455,10 +423,10 @@ def compute_rewards(
     if rew_scale_time is not None:
         rew_time = dist_to_goal * torch.exp(rew_scale_time * episode_length_buf)
         total_reward = rew_termination + rew_goal + rew_distance
-        return rew_distance, rew_goal, rew_termination, total_reward, dist_to_goal
+        return total_reward, dist_to_goal
     
     total_reward = rew_termination + rew_goal + rew_distance
-    return rew_distance, rew_goal, rew_termination, total_reward, dist_to_goal
+    return total_reward, dist_to_goal
 
 @torch.jit.script
 def compute_cost(
@@ -593,6 +561,7 @@ class Maze:
         
     def distance_from_line(self, point, start, end):
         # compute perpendicular distance from point to the line defined by start and end.
+        import numpy as np
         if isinstance(point, list):
             point = torch.tensor(point, device=torch.device("cuda" if torch.cuda.is_available() else "cpu"))
         if point.is_cuda:  # check if the tensor is on a GPU
@@ -656,6 +625,9 @@ class Maze:
         # --- Case 1: When projection falls on the segment (0 <= t <= 1) ---
         mask_inside = (t >= 0.0) & (t <= 1.0)  # shape: [num_envs, num_walls]
         d_on_segment = torch.clamp(d_perp - self.width/2.0, min=0.0)  # adjusted distance when on segment
+
+        # --- Case 2: When projection falls outside the segment (t < 0 or t > 1) ---
+        mask_outside = ~mask_inside
 
         # For outside cases, determine the closest endpoint.
         # For t < 0, use walls_start; for t > 1, use walls_end.

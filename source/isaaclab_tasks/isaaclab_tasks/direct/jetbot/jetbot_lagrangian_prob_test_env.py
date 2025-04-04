@@ -319,7 +319,7 @@ class JetBotEnv(DirectRLEnv):
         self.logger.record(self.dual_multiplier, mean_d_r, std_d_r, mean_g_r, std_g_r, mean_t_r, std_t_r,
                            mean_r, std_r, mean_c, std_c, mean_r - self.dual_multiplier*mean_c, safety_prob)
 
-        return primary_reward - self.dual_multiplier * constraint_cost
+        return primary_reward + self.dual_multiplier * safety_prob
         #return primary_reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:

@@ -169,7 +169,8 @@ class PPO_LagrangianWrapper:
         """
         Update the dual variable (Lagrange multiplier) based on the current constraint cost.
         """
-        constraint_cost = self.env._get_constraint_cost().mean().item()
+        # constraint_cost = self.env._get_constraint_cost().mean().item()
+        constraint_cost = self.compute_total_constraint_cost()
         # Dual update (gradient ascent) with projection onto non-negative values:
         self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (constraint_cost - self.constraint_limit))
         # Update the environment with the new dual value:

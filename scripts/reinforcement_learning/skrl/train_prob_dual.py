@@ -187,7 +187,7 @@ class PPO_LagrangianWrapper:
             mean_reward = r.mean().item()
             mean_cost = c.mean().item()
             safety_prob = self.env._get_safety_probability().item()
-            total_reward = mean_reward - self.lambda_val * mean_cost
+            total_reward = mean_reward + self.lambda_val * safety_prob
 
             # Update the dual variable
             self.update_dual()
