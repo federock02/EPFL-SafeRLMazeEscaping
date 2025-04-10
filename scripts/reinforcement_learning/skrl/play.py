@@ -142,8 +142,6 @@ def main():
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
 
-    get_unwrapped_env(env)._set_num_envs(args_cli.num_envs)
-
     # get environment (physics) dt for real-time evaluation
     try:
         dt = env.physics_dt

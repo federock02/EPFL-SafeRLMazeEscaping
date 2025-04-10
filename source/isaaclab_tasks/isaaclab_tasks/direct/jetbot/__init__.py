@@ -56,7 +56,7 @@ gym.register(
 )
 
 gym.register(
-    id="Isaac-JetBot-Dual-RL-Direct-v1",
+    id="Isaac-JetBot-Moving-Dual-RL-Direct-v0",
     entry_point=f"{__name__}.jetbot_moving_obs_test_env:JetBotEnv",
     disable_env_checker=True,
     kwargs={

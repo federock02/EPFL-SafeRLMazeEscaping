@@ -154,6 +154,7 @@ class PPO_LagrangianWrapper:
 
         # Set the dual multiplier in the environment so that the reward function uses it
         self.env._set_dual_multiplier(self.lambda_val)
+        self.env._set_obstacle_size(0.05)
         self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0, 0.0)
 
     def compute_total_constraint_cost(self) -> float:
@@ -205,8 +206,12 @@ class PPO_LagrangianWrapper:
 
             # Log current timestep and statistics
             self.logger.record(self.total_timesteps_run, self.lambda_val, mean_reward, mean_cost, total_reward, safety_prob)
-            print(f"Progress: {self.total_timesteps_run/total_timesteps*100:.2f}%")
+            progress = self.total_timesteps_run / total_timesteps * 100
+            print(f"Progress: {progress:.2f}%")
             print("Expected time remaining: ", (datetime.now() - self.start_time) * (total_timesteps - self.total_timesteps_run) / self.total_timesteps_run)
+            if int(progress) % 10 == 0 and int(progress) > 0:
+                print("Increasing obstacle size")
+                self.env._change_obstacle_size(int(progress)/100)
 
         return self.runner
 

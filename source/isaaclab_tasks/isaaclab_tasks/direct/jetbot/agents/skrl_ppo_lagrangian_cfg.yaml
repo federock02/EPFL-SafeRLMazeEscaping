@@ -74,9 +74,9 @@ agent:
 # Lagrangian configuration
 lagrangian:
   initial_lambda: 0.0
-  cost_limit: 0.001
-  min_safety_probability: 0.999
-  learning_rate_lambda: 5.0e-2
+  cost_limit: 0.005
+  min_safety_probability: 0.99
+  learning_rate_lambda: 0.5
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
@@ -84,15 +84,17 @@ trainer:
   class: SequentialTrainer
   timesteps: 200
   environment_info: log
-  total_timesteps: 30000
+  total_timesteps: 1000
 
 # Environment configuration
 rewards:
   goal: 10
-  distance: 50
-  termination: -2
+  distance: 40
+  termination: -3
   time: null
+  movement: 1
+  movement_threshold: 0.01
 costs:
-  obstacle: 1
-min_dist: 0.1
+  obstacle: 2
+min_dist: 0.16
 

@@ -32,67 +32,70 @@ class CustomCSVLogger:
 
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         self.filename = os.path.join(log_dir, f"iter_reward_log_{timestamp}.csv")
+        self.header = ["dual", "dist_rewards", "dr_std", "goal_reward", "gr_std", "term_reward", "tr_std",
+                       "mean_reward", "std_reward", "mean_cost", "std_cost", "total_reward", "safety_prob"]
+        self._write_header()
 
+    def _write_header(self):
         with open(self.filename, mode="w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["dual", "dist_rewards", "dr_std", "goal_reward", "gr_std", "term_reward", "tr_std", 
-                             "mean_reward", "std_reward", "mean_cost", "std_cost", "total_reward", "safety_prob"])
+            writer.writerow(self.header)
 
-    def record(self, dual: float, dist_reward: float, dist_std: float, goal_reward: float, goal_std: float, 
-               term_reward: float, term_std: float, mean_reward: float, std_reward: float, mean_cost: float, 
+    def record(self, dual: float, dist_reward: float, dist_std: float, goal_reward: float, goal_std: float,
+               term_reward: float, term_std: float, mean_reward: float, std_reward: float, mean_cost: float,
                std_cost: float, total_reward: float, safety_prob: float) -> None:
+        data = [dual, dist_reward, dist_std, goal_reward, goal_std, term_reward, term_std,
+                mean_reward, std_reward, mean_cost, std_cost, total_reward, safety_prob]
         with open(self.filename, mode="a", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow([dual, dist_reward, dist_std, goal_reward, goal_std, term_reward, term_std, 
-                             mean_reward, std_reward, mean_cost, std_cost, total_reward, safety_prob])
+            writer.writerow(data)
 
 def get_unwrapped_env(env):
     """
-    Iteratively unwrap the environment until you reach the base environment.
+    Recursively unwraps the environment until the base environment is reached.
+    Handles 'env' or 'venv' attributes.
     """
-    while hasattr(env, "env") or hasattr(env, "venv"):
-        env = getattr(env, "env", getattr(env, "venv", env))
-    return env
+    current_env = env
+    while hasattr(current_env, "env") or hasattr(current_env, "venv"):
+        current_env = getattr(current_env, "env", getattr(current_env, "venv", current_env))
+    return current_env
 
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
-    # env
-    decimation = 1
-    episode_length_s = 20.0
-    action_scale = 1.0
-    action_space = 2
-    observation_space = 10 # x, y, yaw_diff, left_wheel_vel, right_wheel_vel, distance_to_goal_x, distance_to_goal_y, 3*distance_to_obstacle
-    state_space = 0
+    # Environment
+    decimation: int = 1
+    episode_length_s: float = 20.0
+    action_scale: float = 1.0
+    action_space: int = 2
+    # observation_space: int = 10 # x, y, distance_to_goal_x, distance_to_goal_y, yaw_diff, base_lin_vel, base_ang_vel, 3*distance_to_obstacle
+    #observation_space: int = 9 # x, y, distance_to_goal, yaw_diff, base_lin_vel, base_ang_vel, 3*distance_to_obstacle
+    observation_space: int = 12  # x, y, distance_to_goal, yaw_diff, base_lin_vel, base_ang_vel, 3*distance_to_obstacle, 3*angle_diff
+    state_space: int = 0
 
-    # simulation
+    # Simulation
     sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
 
-    # robot
-    # the path represent the position of the robot prim in the hierarchical representation of the scene
-    # using regex to match the robot prim in all environments for multi-environment training
+    # Robot
     robot_cfg: ArticulationCfg = JETBOT_CFG.replace(prim_path="/World/envs/env_.*/JetBot")
-    left_wheel_joint_name = "left_wheel_joint"
-    right_wheel_joint_name = "right_wheel_joint"
+    left_wheel_joint_name: str = "left_wheel_joint"
+    right_wheel_joint_name: str = "right_wheel_joint"
 
-    # scene
+    # Scene
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=64, env_spacing=3.0, replicate_physics=True)
-    
-    # reset
-    max_distance_from_goal = 7.0 # jetbot moved too far from goal
-    initial_pose_min_distance = 2.8  # the minimum distance from the goal
-    initial_pose_radius = 5.0  # the radius around goal in which the jetbot initial position is sampled
 
-    wall_width = 0.8
+    # Reset
+    max_distance_from_goal: float = 7.0
+    initial_pose_min_distance: float = 2.8
+    initial_pose_radius: float = 5.0
+    spawn_height: float = 0.0437
 
-    # goal
-    goal_pos = [0.0, 0.0]
+    # World
+    wall_width: float = 0.8
+    goal_pos: list[float] = [0.0, 0.0]
 
-    # spawn height
-    spawn_height = 0.0437
-
-    # robot geometry
-    wheelbase = 0.12
-    wheelradius = 0.032
+    # Robot Geometry
+    wheelbase: float = 0.12
+    wheelradius: float = 0.032
 
 
 class JetBotEnv(DirectRLEnv):
@@ -102,55 +105,51 @@ class JetBotEnv(DirectRLEnv):
         self.maze = Maze()
         super().__init__(cfg, render_mode, **kwargs)
 
-        # use the joint names from the configuration to find indices in the articulation
         self._left_wheel_idx, _ = self.jetbot.find_joints(self.cfg.left_wheel_joint_name)
         self._right_wheel_idx, _ = self.jetbot.find_joints(self.cfg.right_wheel_joint_name)
         self.action_scale = self.cfg.action_scale
 
-        # cache joint positions and velocities data for efficiency
         self.joint_pos = self.jetbot.data.joint_pos
         self.joint_vel = self.jetbot.data.joint_vel
 
-        # previous distance to goal, used in reward computation
-        self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
+        self.previous_distance_to_goal = torch.zeros(self.num_envs, device=self.device)
 
-        # gamma for reward computation
         config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_lagrangian_cfg.yaml")
         print("Config path: ", config_path)
-        with open(config_path) as stream:
-            try:
+        try:
+            with open(config_path) as stream:
                 data = yaml.safe_load(stream)
                 self.gamma = data["agent"]["discount_factor"]
-                self.rew_scale_goal = data["rewards"]["goal"]
-                self.rew_scale_distance = data["rewards"]["distance"]
-                self.rew_scale_terminated = data["rewards"]["termination"]
-                self.rew_scale_time = data["rewards"]["time"]
+                self.reward_scale_goal = data["rewards"]["goal"]
+                self.reward_scale_distance = data["rewards"]["distance"]
+                self.reward_scale_terminated = data["rewards"]["termination"]
+                self.reward_scale_time = data["rewards"].get("time")  # Use .get() for optional key
                 self.cost_obstacle = data["costs"]["obstacle"]
-                self.min_dist_to_obstacle = data["min_dist"]
-            except yaml.YAMLError as exc:
-                self.gamma = 0.99
-                self.rew_scale_goal = 30.0
-                self.rew_scale_distance = 50.0
-                self.rew_scale_terminated = -80.0
-                self.rew_scale_time = None
-                self.cost_obstacle = 1.0
-                self.min_dist_to_obstacle = 0.18
-        
+                self.min_distance_to_obstacle = data["min_dist"]
+        except yaml.YAMLError as exc:
+            print(f"Error loading YAML config: {exc}. Using default reward/cost parameters.")
+            self.gamma = 0.99
+            self.reward_scale_goal = 30.0
+            self.reward_scale_distance = 50.0
+            self.reward_scale_terminated = -80.0
+            self.reward_scale_time = None
+            self.cost_obstacle = 1.0
+            self.min_distance_to_obstacle = 0.18
+
         print("Gamma: ", self.gamma)
-        print("Rew scale goal: ", self.rew_scale_goal)
-        print("Rew scale distance: ", self.rew_scale_distance)
-        print("Rew scale terminated: ", self.rew_scale_terminated)
+        print("Reward scale goal: ", self.reward_scale_goal)
+        print("Reward scale distance: ", self.reward_scale_distance)
+        print("Reward scale terminated: ", self.reward_scale_terminated)
         print("Cost obstacle: ", self.cost_obstacle)
-        print("Min dist to obstacle: ", self.min_dist_to_obstacle)
+        print("Min dist to obstacle: ", self.min_distance_to_obstacle)
 
         self.dual_multiplier = 0.0
-        self.n_envs = 16
+        self.n_envs = self.cfg.scene.num_envs  # Use num_envs from config
 
-        # logging
-        self.episode_rewards = torch.zeros(self.n_envs, device=self.device)
-        self.episode_costs = torch.zeros(self.n_envs, device=self.device)
-        self.last_episode_costs = torch.zeros(self.n_envs, device=self.device)
-        self.safety_indicator = torch.ones(self.n_envs, device=self.device)
+        self.episode_rewards = torch.zeros(self.num_envs, device=self.device)
+        self.episode_costs = torch.zeros(self.num_envs, device=self.device)
+        self.last_episode_costs = torch.zeros(self.num_envs, device=self.device)
+        self.safety_indicator = torch.ones(self.num_envs, device=self.device)
 
         self.logger = CustomCSVLogger()
 
@@ -198,167 +197,168 @@ class JetBotEnv(DirectRLEnv):
         self.maze.spawn_maze(width=self.cfg.wall_width)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = self.action_scale * actions.clone()
+        self.actions = self.cfg.action_scale * actions.clone()
 
     def _apply_action(self) -> None:
-        # assume actions are the wheel velocities
         left_action = self.actions[:, 0].unsqueeze(-1)
         right_action = self.actions[:, 1].unsqueeze(-1)
-        #print("Left action: ", left_action)
-        #print("Right action: ", right_action)
-        # set the wheel velocities
         self.jetbot.set_joint_velocity_target(left_action, joint_ids=self._left_wheel_idx)
         self.jetbot.set_joint_velocity_target(right_action, joint_ids=self._right_wheel_idx)
 
     def _get_observations(self) -> dict:
-        # gethering observations
-        # position: x, y from the root position
-        pos = self.jetbot.data.root_pos_w[:, :2]
-        #print("Robot pos: ", pos)
+        # Get robot position (x, y)
+        position = self.jetbot.data.root_pos_w[:, :2]
 
-        dist_to_obs = self.maze.check_collision(pos)
+        # Compute robot yaw
+        orientation = self.jetbot.data.root_quat_w
+        yaw = self._compute_yaw(orientation).squeeze(-1)
 
-        # compute safety indicator
-        too_close_mask = (dist_to_obs < self.min_dist_to_obstacle).any(dim=1)
-        self.safety_indicator[too_close_mask] = 0
+        # Check collisions and get distances and angles to obstacles
+        distance_to_obstacles, obstacle_angle_difference = self.maze.check_collision_ang(position, yaw)
 
-        # orientation: compute yaw from the root orientation
-        orient = self.jetbot.data.root_quat_w
-        yaw = self._compute_yaw(orient).squeeze(-1)  # helper function defined below.
-        #print("Robot yaw: ", yaw)
+        # Compute safety indicator
+        too_close = (distance_to_obstacles < self.min_distance_to_obstacle).any(dim=1)
+        self.safety_indicator[too_close] = 0
 
-        # wheel velocities
-        left_wheel_vel = self.joint_vel[:, self._left_wheel_idx].squeeze(-1).unsqueeze(-1)
-        right_wheel_vel = self.joint_vel[:, self._right_wheel_idx].squeeze(-1).unsqueeze(-1)
+        # Get wheel velocities
+        left_wheel_velocity = self.joint_vel[:, self._left_wheel_idx].squeeze(-1).unsqueeze(-1)
+        right_wheel_velocity = self.joint_vel[:, self._right_wheel_idx].squeeze(-1).unsqueeze(-1)
 
-        base_v, base_omega = inverse_diff_drive(left_wheel_vel, right_wheel_vel, self.cfg.wheelbase, self.cfg.wheelradius)
+        # Compute distance to goal
+        goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=position.device).unsqueeze(0).expand(self.num_envs, -1)
+        vector_to_goal = goal_xy - position
+        distance_to_goal = torch.norm(vector_to_goal, dim=1, keepdim=True)
 
-        # distance to goal (use only x, y coordinates)
-        goal_xy = torch.tensor(self.cfg.goal_pos[:2], device=pos.device)
-        goal_xy = goal_xy.unsqueeze(0).expand(pos.shape[0], -1)
+        # Compute angle to goal
+        angle_to_goal = torch.atan2(vector_to_goal[:, 1], vector_to_goal[:, 0]).unsqueeze(-1) # Shape [4096, 1]
 
-        # in order to compute the distance to the goal, we need to convert the goal position to a tensor
-        # the goal position tensor needs to be on the same device as the observations
-        # compute distance to goal per robot
-        dist_to_goal = pos - goal_xy  # shape: [256, 2]
-        # extract x and y differences and ensure each has shape [256, 1]
-        dist_to_goal_x = dist_to_goal[:, 0].unsqueeze(-1)
-        dist_to_goal_y = dist_to_goal[:, 1].unsqueeze(-1)
-        # print("Distance to goal: ", dist_to_goal_x, dist_to_goal_y)
+        # Compute yaw difference to goal
+        yaw_difference = (angle_to_goal - yaw + torch.pi) % (2 * torch.pi) - torch.pi
 
-        # compute the angle to the goal using atan2
-        goal_direction = torch.stack((dist_to_goal_x.squeeze(-1), dist_to_goal_y.squeeze(-1)), dim=1)
-        goal_angle = torch.atan2(goal_direction[:, 1], goal_direction[:, 0])
+        # print("Position: ", position.shape)
+        # print("Distance to goal: ", distance_to_goal.shape)
+        # print("Yaw difference: ", yaw_difference.shape)
+        # print("Left wheel velocity: ", left_wheel_velocity.shape)
+        # print("Right wheel velocity: ", right_wheel_velocity.shape)
+        # print("Distance to obstacles: ", distance_to_obstacles.shape)
+        # print("Obstacle angle difference: ", obstacle_angle_difference.shape)
 
-        # compute the angle difference (yaw error)
-        angle_diff = goal_angle - yaw
-        # normalize to range [-π, π] using modulo operation
-        angle_diff = (angle_diff + torch.pi) % (2 * torch.pi) - torch.pi
-        angle_diff = angle_diff.unsqueeze(-1)
+        # Concatenate observations
+        observation = torch.cat((
+            position,
+            distance_to_goal,
+            yaw_difference,
+            left_wheel_velocity,
+            right_wheel_velocity,
+            distance_to_obstacles,
+            obstacle_angle_difference,
+        ), dim=-1)
 
-        # concatenate into a single observation vector
-        obs = torch.cat((pos,
-                         angle_diff,
-                         base_v,
-                         base_omega,
-                         dist_to_goal_x,
-                         dist_to_goal_y,
-                         dist_to_obs,
-                        ), dim=-1)
-        return {"policy": obs}
+        return {"policy": observation}
     
     def _get_rewards(self) -> torch.Tensor:
-        # compute rewards
-        # combination of reaching the goal, moving towards the goal, and penalizing termination
+        # Compute distances to obstacles
+        distances_to_obstacles = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2])
 
-        dist_to_obs = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2])
-        #print("Distance to obstacles: ", dist_to_obs)
-
-        # compute rewards
-        # combination of reaching the goal, moving towards the goal, and penalizing termination
-        dist_r, goal_r, term_r, primary_reward, dist = compute_rewards(
-            self.rew_scale_terminated,
-            self.rew_scale_goal,
-            self.rew_scale_distance,
-            self.rew_scale_time,
-            self.jetbot.data.root_pos_w[:, :2], # shape [batch_size, 2] # root position
-            self.cfg.goal_pos[:2], # shape [1, 2] # goal position
-            self.cfg.initial_pose_radius, # max distance from goal, for distance penalty
-            self.prec_dist,
-            self.episode_length_buf,
-            self.gamma
+        # Compute individual reward components and total primary reward
+        distance_reward, goal_reward, termination_reward, primary_reward, current_distance_to_goal = compute_rewards(
+            self.reward_scale_terminated,
+            self.reward_scale_goal,
+            self.reward_scale_distance,
+            self.reward_scale_time,
+            self.jetbot.data.root_pos_w[:, :2],  # Robot root position (x, y)
+            self.cfg.goal_pos[:2],  # Goal position (x, y)
+            self.cfg.initial_pose_radius,  # Max distance for distance penalty
+            self.previous_distance_to_goal,  # Previous distance to goal
+            self.episode_length_buf,  # Episode length buffer
+            self.gamma  # Discount factor
         )
 
-        self.prec_dist = dist
+        # Update previous distance to goal for the next step
+        self.previous_distance_to_goal = current_distance_to_goal
 
+        # Compute constraint cost based on distance to obstacles
         constraint_cost = compute_cost(
             self.cost_obstacle,
-            self.min_dist_to_obstacle + self.cfg.wall_width / 2.0,
-            dist_to_obs,
+            self.min_distance_to_obstacle + self.cfg.wheelbase / 2.0,
+            distances_to_obstacles,
         )
         self._computed_constraint_cost = constraint_cost
 
+        # Update episode rewards and costs
         self.episode_rewards += primary_reward
         self.episode_costs += constraint_cost
         self.last_episode_costs = constraint_cost
 
-        mean_d_r = dist_r.mean().item()
-        mean_g_r = goal_r.mean().item()
-        mean_t_r = term_r.mean().item()
-        std_d_r = dist_r.std().item()
-        std_g_r = goal_r.std().item()
-        std_t_r = term_r.std().item()
+        # Calculate mean and standard deviation of reward components and total reward/cost
+        mean_distance_reward = distance_reward.mean().item()
+        mean_goal_reward = goal_reward.mean().item()
+        mean_termination_reward = termination_reward.mean().item()
+        std_distance_reward = distance_reward.std().item()
+        std_goal_reward = goal_reward.std().item()
+        std_termination_reward = termination_reward.std().item()
 
-        mean_r = primary_reward.mean().item()
-        std_r = primary_reward.std().item()
-        mean_c = constraint_cost.mean().item()
-        std_c = constraint_cost.std().item()
+        mean_total_reward = primary_reward.mean().item()
+        std_total_reward = primary_reward.std().item()
+        mean_total_cost = constraint_cost.mean().item()
+        std_total_cost = constraint_cost.std().item()
 
-        safety_prob = self._get_safety_probability().item()
+        # Get safety probability
+        safety_probability = self._get_safety_probability().item()
 
-        self.logger.record(self.dual_multiplier, mean_d_r, std_d_r, mean_g_r, std_g_r, mean_t_r, std_t_r,
-                           mean_r, std_r, mean_c, std_c, mean_r - self.dual_multiplier*mean_c, safety_prob)
+        # Log the reward and cost information
+        total_lagrangian_reward = mean_total_reward - self.dual_multiplier * mean_total_cost
+        self.logger.record(self.dual_multiplier, mean_distance_reward, std_distance_reward,
+                           mean_goal_reward, std_goal_reward, mean_termination_reward, std_termination_reward,
+                           mean_total_reward, std_total_reward, mean_total_cost, std_total_cost,
+                           total_lagrangian_reward, safety_probability)
 
-        return primary_reward + self.dual_multiplier * safety_prob
-        #return primary_reward
+        # Return the Lagrangian reward
+        # return primary_reward - self.dual_multiplier * constraint_cost
+        return primary_reward + self.dual_multiplier * safety_probability
+        # return primary_reward # Uncomment to return only the primary reward
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # check if the episode has run out of time
+        # Check if the episode has run out of time
         time_out = self.episode_length_buf >= self.max_episode_length - 1
 
-        # check if the robot has gone out of bounds
+        # Check if the robot has gone out of bounds
         out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_goal, dim=1)
 
-        # check if the robot has reached the goal
-        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2] 
+        # Check if the robot has reached the goal
+        reached_goal = torch.norm(self.jetbot.data.root_pos_w[:, :2]
                                   - torch.tensor(self.cfg.goal_pos[:2], device=self.jetbot.data.root_pos_w.device), dim=1) <= 0.1
-            
-        # episode is done if any of the conditions are met
-        return out_of_bounds | reached_goal, time_out
+
+        # Episode is done if any of the conditions are met
+        dones = out_of_bounds | reached_goal
+        return dones, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None):
         if env_ids is None:
             env_ids = self.jetbot._ALL_INDICES
         super()._reset_idx(env_ids)
 
-        # sample a new starting position within initial_pose_radius around the goal
+        # Sample a new starting position within initial_pose_radius around the goal
         num_ids = len(env_ids)
 
-        # random angle and radius around goal
+        # Random angle and radius around goal
         theta = torch.rand(num_ids, device=self.device) * 2 * math.pi
         r = torch.sqrt(
-            torch.rand(num_ids, device=self.device) * 
-            (self.cfg.initial_pose_radius**2 - self.cfg.initial_pose_min_distance**2) + 
+            torch.rand(num_ids, device=self.device) *
+            (self.cfg.initial_pose_radius**2 - self.cfg.initial_pose_min_distance**2) +
             self.cfg.initial_pose_min_distance**2
         )
 
-        # transform polar coordinates to cartesian coordinates
+        # Transform polar coordinates to Cartesian coordinates
         new_x = self.cfg.goal_pos[0] + r * torch.cos(theta)
         new_y = self.cfg.goal_pos[1] + r * torch.sin(theta)
         new_z = torch.ones_like(new_x) * self.cfg.spawn_height
         new_positions = torch.stack([new_x, new_y, new_z], dim=1)
 
-        # sample a new starting yaw angle
+        # Reset previous distance
+        self.previous_distance_to_goal[env_ids] = torch.zeros(num_ids, device=self.device)
+
+        # Sample a new starting yaw angle
         axis = torch.zeros(num_ids, 3, device=self.device)
         axis[:, 2] = 1.0 # rotation around z-axis
         angle = torch.rand(num_ids, device=self.device) * 2 * math.pi
@@ -371,10 +371,8 @@ class JetBotEnv(DirectRLEnv):
         qw = cos_half_angle
         new_orientation = torch.stack([qw, qx, qy, qz], dim=1)
 
-        self.prec_dist = torch.zeros(self.jetbot.data.root_pos_w.shape[0], device=self.device)
-
-        # set position and orientation
-        default_root_state = self.jetbot.data.default_root_state[env_ids]
+        # Apply new poses to the robots
+        default_root_state = self.jetbot.data.default_root_state[env_ids].clone() # Use clone to avoid modifying original
         default_root_state[:, :3] = new_positions
         default_root_state[:, 3:7] = new_orientation
 
@@ -384,14 +382,22 @@ class JetBotEnv(DirectRLEnv):
         self.safety_indicator[env_ids] = 1
 
     def _compute_yaw(self, quaternions: torch.Tensor) -> torch.Tensor:
-        # convert quaternion [w, x, y, z] to yaw angle
+        """
+        Converts a batch of quaternions [w, x, y, z] to yaw angles.
+
+        Args:
+            quaternions (torch.Tensor): Tensor of quaternions with shape [num_envs, 4].
+
+        Returns:
+            torch.Tensor: Tensor of yaw angles with shape [num_envs, 1].
+        """
         w = quaternions[:, 0]
         x = quaternions[:, 1]
         y = quaternions[:, 2]
         z = quaternions[:, 3]
-        # calculate yaw using the standard formula
+        # Calculate yaw using the standard formula
         yaw = torch.atan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
-        return yaw
+        return yaw.unsqueeze(-1)
     
     def _set_dual_multiplier(self, value: float) -> None:
         self.dual_multiplier = value
@@ -407,17 +413,12 @@ class JetBotEnv(DirectRLEnv):
         self.episode_rewards = torch.zeros(self.n_envs, device=self.device)
         self.episode_costs = torch.zeros(self.n_envs, device=self.device)
         self.last_episode_costs = torch.zeros(self.n_envs, device=self.device)
-        self.safety_indicator = torch.ones(self.n_envs, device=self.device)
     
     def _get_reward_and_cost(self):
         return self.episode_rewards, self.episode_costs
-    
-    def _set_num_envs(self, num_envs):
-        self.n_envs = num_envs
 
     def _domain_randomize(self):
         self.maze.move_walls(0.1)
-
 
 # decorator to compile the function to TorchScript
 # https://pytorch.org/docs/stable/jit.html
@@ -444,11 +445,7 @@ def compute_rewards(
 
     rew_goal = rew_scale_goal * (dist_to_goal <= 0.1).float() #* (gamma ** episode_length_buf)/(1.0 - gamma)
 
-    rew_distance = torch.where(
-        (prec_dist == 0.0) | torch.isclose(prec_dist - dist_to_goal, torch.tensor(0.0, device=prec_dist.device), atol=1e-6), 
-        torch.zeros_like(dist_to_goal), 
-        prec_dist - dist_to_goal
-    )
+    rew_distance = torch.where((prec_dist == 0.0), torch.zeros_like(dist_to_goal), prec_dist - dist_to_goal)
 
     rew_distance = rew_scale_distance * rew_distance
 
@@ -686,6 +683,106 @@ class Maze:
 
         return smallest3
     
+    def check_collision_ang(self, pos, yaw):
+        """
+        Compute the distances from each robot (given by their positions pos)
+        to each wall defined by its start and end points.
+        Also compute the angle difference between the robot's yaw and the wall direction.
+        
+        Args:
+            pos (torch.Tensor): Robot positions, shape [num_envs, 2].
+            min_dist (float): Minimum allowed distance from the wall.
+            
+        Returns:
+            torch.Tensor: A tensor of shape [num_envs, 3] with the computed distances to the 3 closest walls.
+                        (You can then choose how to aggregate these, e.g. taking the minimum.)
+            torch.Tensor: A tensor of shape [num_envs, 3] with the angle differences to the 3 closest walls.
+        """
+        # Adjust the minimum distance by adding half the wall width if needed.
+        #min_dist_adjusted = min_dist + self.width / 2.0
+
+        yaw.unsqueeze_(1)  # shape: [num_envs, 1]
+
+        # walls_start_tensor and walls_end_tensor are assumed to have shape [num_walls, 2]
+        walls_start = self.walls_start_tensor  # shape: [num_walls, 2]
+        walls_end = self.walls_end_tensor      # shape: [num_walls, 2]
+        
+        # Compute wall direction vectors and their squared lengths
+        wall_dirs = walls_end - walls_start            # shape: [num_walls, 2]
+        norm_wall_dirs_sq = (wall_dirs ** 2).sum(dim=1)  # shape: [num_walls]
+        norm_wall_dirs_sq = torch.where(norm_wall_dirs_sq == 0, torch.tensor(1e-6, device=pos.device), norm_wall_dirs_sq)
+        
+        # Expand dimensions so that we can compute pairwise differences:
+        # pos: [num_envs, 2] -> [num_envs, 1, 2]
+        # walls_start: [num_walls, 2] -> [1, num_walls, 2]
+        pos_exp = pos.unsqueeze(1)              # shape: [num_envs, 1, 2]
+        walls_start_exp = walls_start.unsqueeze(0)  # shape: [1, num_walls, 2]
+        wall_dirs_exp = wall_dirs.unsqueeze(0)      # shape: [1, num_walls, 2]
+        walls_end_exp = walls_end.unsqueeze(0)      # shape: [1, num_walls, 2]
+
+        # Compute vector from wall start to each robot position
+        vec = pos_exp - walls_start_exp          # shape: [num_envs, num_walls, 2]
+        
+        # Compute the projection parameter t for each robot-wall pair:
+        # t = ((P - A) dot (B - A)) / ||B-A||^2
+        dot = (vec * wall_dirs_exp).sum(dim=2)     # shape: [num_envs, num_walls]
+        norm_sq = norm_wall_dirs_sq.unsqueeze(0)    # shape: [1, num_walls]
+        t = dot / norm_sq                          # shape: [num_envs, num_walls]
+        
+        # Compute the projection point on the infinite line: P_proj = A + t*(B-A)
+        p_proj = walls_start_exp + t.unsqueeze(-1) * wall_dirs_exp  # shape: [num_envs, num_walls, 2]
+    
+        # Compute perpendicular distance (d_perp) to the infinite line
+        d_perp = torch.norm(pos_exp - p_proj, dim=2)           # shape: [num_envs, num_walls]
+
+        # --- Case 1: When projection falls on the segment (0 <= t <= 1) ---
+        mask_inside = (t >= 0.0) & (t <= 1.0)  # shape: [num_envs, num_walls]
+        d_on_segment = torch.clamp(d_perp - self.width/2.0, min=0.0)  # adjusted distance when on segment
+
+        # For outside cases, determine the closest endpoint.
+        # For t < 0, use walls_start; for t > 1, use walls_end.
+        # Compute distance from projection to A and B.
+        d_ep_A = torch.norm(p_proj - walls_start_exp, dim=2)  # distance from projection to start, shape: [num_envs, num_walls]
+        d_ep_B = torch.norm(p_proj - walls_end_exp, dim=2)      # distance from projection to end, shape: [num_envs, num_walls]
+        # Choose the correct endpoint distance based on t.
+        d_ep = torch.where(t < 0, d_ep_A, d_ep_B)  # shape: [num_envs, num_walls]
+        
+        # Now, for outside cases, further decide:
+        # If d_perp < w/2, robot is "beside" the wall; use d_ep.
+        # Else, robot is near a corner; use corner distance computed as:
+        # d_corner = sqrt( d_ep^2 + (d_perp - w/2)^2 ).
+        corner_distance = torch.sqrt(d_ep**2 + (d_perp - self.width/2.0)**2)
+        # Choose: if d_perp < w/2, then use d_ep; else, use corner_distance.
+        d_outside = torch.where(d_perp < self.width/2.0, d_ep, corner_distance)
+
+        # For outside, use d_outside; for inside, use d_on_segment.
+        final_dists = torch.where(mask_inside, d_on_segment, d_outside)  # shape: [num_envs, num_walls]
+
+        #capped_dist = torch.where(final_dists <= 0.4, final_dists, torch.tensor(0.4, device=final_dists.device))
+        
+        # Optionally sort and return the smallest few distances.
+        sorted_dists, sorted_indices = torch.sort(final_dists, dim=1)
+        #sorted_dists, _ = torch.sort(capped_dist, dim=1)
+        smallest3 = sorted_dists[:, :3]
+        #print("Distances: ", smallest3)
+        top3_indices = sorted_indices[:, :3]
+
+        # Extract the vectors from robot to the 3 closest projection points
+        # p_proj: [num_envs, num_walls, 2] → pick top3
+        # Use gather with proper indexing
+        batch_indices = torch.arange(pos.shape[0], device=pos.device).unsqueeze(1).expand(-1, 3)
+        p_proj_closest = p_proj[batch_indices, top3_indices]          # shape: [num_envs, 3, 2]
+        vectors_to_obs = p_proj_closest - pos.unsqueeze(1)            # [num_envs, 3, 2]
+
+        # Compute direction angle of each vector: atan2(dy, dx)
+        obs_angles = torch.atan2(vectors_to_obs[:, :, 1], vectors_to_obs[:, :, 0])  # [num_envs, 3]
+
+        # Compute yaw difference: wrap to (-π, π]
+        angle_diffs = obs_angles - yaw                                # [num_envs, 3]
+        angle_diffs = (angle_diffs + torch.pi) % (2 * torch.pi) - torch.pi
+
+        return smallest3, angle_diffs
+
     def move_walls(self, percent):
         new_walls = []
         for wall in self.walls:
@@ -698,23 +795,47 @@ class Maze:
             new_walls.append({"start": new_start, "end": new_end})
 
 
-def direct_diff_drive(v, omega, L, r):
-    # convert base velocity commands (v, ω) into left and right wheel velocities
+def direct_diff_drive(linear_velocity: float, angular_velocity: float, wheelbase: float, wheel_radius: float) -> tuple[float, float]:
+    """
+    Converts base linear and angular velocity commands into left and right wheel velocities for a differential drive robot.
 
-    # compute left & right wheel velocities using differential drive formula
-    v_left = v - (omega * L / 2)
-    w_left = v_left / r
-    v_right = v + (omega * L / 2)
-    w_right = v_right / r
+    Args:
+        linear_velocity (float): The desired linear velocity of the robot's center.
+        angular_velocity (float): The desired angular velocity of the robot (yaw rate).
+        wheelbase (float): The distance between the left and right wheels.
+        wheel_radius (float): The radius of the robot's wheels.
 
-    return w_left, w_right
+    Returns:
+        tuple[float, float]: A tuple containing the left wheel angular velocity and the right wheel angular velocity.
+    """
+    # Compute left and right wheel linear velocities
+    v_left = linear_velocity - (angular_velocity * wheelbase / 2)
+    v_right = linear_velocity + (angular_velocity * wheelbase / 2)
 
-def inverse_diff_drive(w_left, w_right, L, r):
-    # convert left and right wheel velocities into base velocity commands (v, ω)
+    # Convert linear velocities to angular velocities
+    omega_left = v_left / wheel_radius
+    omega_right = v_right / wheel_radius
 
-    # compute linear and angular velocities using differential drive formula
-    v = (r / 2) * (w_left + w_right)
-    omega = (r / L) * (w_right - w_left)
+    return omega_left, omega_right
 
-    return v, omega
+def inverse_diff_drive(omega_left: float, omega_right: float, wheelbase: float, wheel_radius: float) -> tuple[float, float]:
+    """
+    Converts left and right wheel angular velocities into base linear and angular velocity commands for a differential drive robot.
+
+    Args:
+        omega_left (float): The angular velocity of the left wheel.
+        omega_right (float): The angular velocity of the right wheel.
+        wheelbase (float): The distance between the left and right wheels.
+        wheel_radius (float): The radius of the robot's wheels.
+
+    Returns:
+        tuple[float, float]: A tuple containing the robot's linear velocity and angular velocity.
+    """
+    # Compute linear velocity
+    linear_velocity = (wheel_radius / 2) * (omega_left + omega_right)
+
+    # Compute angular velocity
+    angular_velocity = (wheel_radius / wheelbase) * (omega_right - omega_left)
+
+    return linear_velocity, angular_velocity
 

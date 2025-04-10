@@ -188,6 +188,7 @@ class PPO_LagrangianWrapper:
             mean_cost = c.mean().item()
             safety_prob = self.env._get_safety_probability().item()
             total_reward = mean_reward + self.lambda_val * safety_prob
+            # total_reward = mean_reward - self.lambda_val * mean_cost
 
             # Update the dual variable
             self.update_dual()
@@ -262,8 +263,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
     
-    get_unwrapped_env(env)._set_num_envs(args_cli.num_envs)
-
     # wrap for video recording
     if args_cli.video:
         video_kwargs = {
