@@ -14,6 +14,7 @@ a more user-friendly way.
 
 import argparse
 import sys
+import math
 
 from isaaclab.app import AppLauncher
 
@@ -209,9 +210,9 @@ class PPO_LagrangianWrapper:
             progress = self.total_timesteps_run / total_timesteps * 100
             print(f"Progress: {progress:.2f}%")
             print("Expected time remaining: ", (datetime.now() - self.start_time) * (total_timesteps - self.total_timesteps_run) / self.total_timesteps_run)
-            if int(progress) % 10 == 0 and int(progress) > 0:
+            if int(progress) % 9 == 0 and int(progress) > 0:
                 print("Increasing obstacle size")
-                self.env._change_obstacle_size(int(progress)/100)
+                self.env._change_obstacle_size(math.ceil(progress / 10) / 10)
 
         return self.runner
 

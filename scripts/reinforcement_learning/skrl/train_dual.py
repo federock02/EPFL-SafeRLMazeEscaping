@@ -177,7 +177,7 @@ class PPO_LagrangianWrapper:
         self.env._set_dual_multiplier(self.lambda_val)
         print(f"Dual updated: {self.lambda_val:.4f} (constraint cost: {constraint_cost:.4f}, limit: {self.constraint_limit:.4f})")
 
-    def run(self, total_timesteps: int, chunk_timesteps: int):
+    def run(self, total_timesteps: int, chunk_timesteps: int, saves_dir: str):
         """
         Run training in chunks, updating the dual variable after each chunk.
         """
@@ -207,6 +207,12 @@ class PPO_LagrangianWrapper:
             self.logger.record(self.total_timesteps_run, self.lambda_val, mean_reward, mean_cost, total_reward, safety_prob)
             print(f"Progress: {self.total_timesteps_run/total_timesteps*100:.2f}%")
             print("Expected time remaining: ", (datetime.now() - self.start_time) * (total_timesteps - self.total_timesteps_run) / self.total_timesteps_run)
+            
+            if self.total_timesteps_run % 10000 == 0:
+                # Save the model every 10,000 timesteps
+                save_path = os.path.join(saves_dir, f"model_{self.total_timesteps_run}.pt")
+                print(f"[INFO] Saving model to: {save_path}")
+                self.runner.agent.save(save_path)
 
         return self.runner
 
@@ -307,15 +313,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     lagrangian_agent = PPO_LagrangianWrapper(runner, constraint_limit=c_limit, alpha_lambda=lr_lambda, initial_lambda=init_l)
     print("[INFO] PPO-Lagrangian wrapper created.")
 
+    saves_dir = os.path.join(log_dir, "saves")
+    try:
+        os.makedirs(saves_dir, exist_ok=True)
+        print(f"[INFO] Created or ensured directory: {saves_dir}")
+    except OSError as e:
+        print(f"[ERROR] Could not create directory {saves_dir}: {e}")
+
     chunk_timesteps = agent_cfg["trainer"]["timesteps"]
     total_timesteps = agent_cfg["trainer"]["total_timesteps"]
     print(f"[INFO] Running training with {total_timesteps} timesteps in chunks of {chunk_timesteps} timesteps")
     init_time = datetime.now()
     # Run training with the wrapper for a total number of timesteps
-    runner_trained = lagrangian_agent.run(total_timesteps=total_timesteps, chunk_timesteps=chunk_timesteps)
+    runner_trained = lagrangian_agent.run(total_timesteps=total_timesteps, chunk_timesteps=chunk_timesteps, saves_dir=saves_dir)
 
     # Optionally, save the final model
-    save_path = os.path.join(log_dir, "final_model.zip")
+    save_path = os.path.join(saves_dir, "final_model.pt")
     print(f"[INFO] Saving final model to: {save_path}")
     #runner.agent.save(os.path.join(agent_cfg["agent"]["experiment"]["experiment_name"], "final_model.zip"))
     runner_trained.agent.save(save_path)

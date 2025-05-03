@@ -136,7 +136,7 @@ def get_unwrapped_env(env):
 # This wrapper is used to train a PPO agent with a constraint cost in the environment
 # The constraint cost is used to update a Lagrange multiplier (dual variable) that adjusts the reward function
 class PPO_LagrangianWrapper:
-    def __init__(self, runner, min_safety: float = 0.0, alpha_lambda: float = 1.0e-4, initial_lambda: float = 1.0):
+    def __init__(self, runner, min_safety: float = 0.0, alpha_lambda: float = 1.0e-4, initial_lambda: float = 1.0, decrease_lr: bool = False):
         """
         runner: an instance of skrl Runner, which encapsulates the agent and environment.
         min_safety: the acceptable minimum threshold for the safety probability.
@@ -156,16 +156,18 @@ class PPO_LagrangianWrapper:
         self.env._set_dual_multiplier(self.lambda_val)
         self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0, 0.0)
 
-    def update_dual(self):
+    def update_dual(self, progress=0.0):
         """
         Update the dual variable (Lagrange multiplier) based on the current constraint cost.
         """
         safety_prob = self.env._get_safety_probability().item()
         # Dual update (gradient ascent) with projection onto non-negative values:
-        self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (self.min_safety - safety_prob))
+        learning_rate = self.alpha_lambda * (1 - progress)
+        self.lambda_val = max(0.0, self.lambda_val + learning_rate * (self.min_safety - safety_prob))
         # Update the environment with the new dual value:
         self.env._set_dual_multiplier(self.lambda_val)
         print(f"Dual updated: {self.lambda_val:.4f} (safety probability: {safety_prob:.4f}, minimum: {self.min_safety:.4f})")
+        print(f"Lambda learning rate: {learning_rate:.4f}")
 
     def run(self, total_timesteps: int, chunk_timesteps: int):
         """
@@ -190,13 +192,15 @@ class PPO_LagrangianWrapper:
             total_reward = mean_reward + self.lambda_val * safety_prob
             # total_reward = mean_reward - self.lambda_val * mean_cost
 
+            progress = self.total_timesteps_run / total_timesteps
+
             # Update the dual variable
-            self.update_dual()
+            self.update_dual(progress)
             #self.env._domain_randomize()
 
             # Log current timestep and statistics
             self.logger.record(self.total_timesteps_run, self.lambda_val, mean_reward, mean_cost, total_reward, safety_prob)
-            print(f"Progress: {self.total_timesteps_run/total_timesteps*100:.2f}%")
+            print(f"Progress: {progress*100:.2f}%")
             print("Expected time remaining: ", (datetime.now() - self.start_time) * (total_timesteps - self.total_timesteps_run) / self.total_timesteps_run)
 
         return self.runner
@@ -294,8 +298,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     print(f"[INFO] Learning rate for dual update: {lr_lambda}")
     init_l = agent_cfg["lagrangian"]["initial_lambda"]
     print(f"[INFO] Initial value for dual variable: {init_l}")
+    decrease_lr = agent_cfg["lagrangian"]["decay_lambda_lr"]
+    print(f"[INFO] Decrease learning rate for dual update: {decrease_lr}")
     # wrap the Runner with PPO-Lagrangian wrapper
-    lagrangian_agent = PPO_LagrangianWrapper(runner, min_safety=min_safety, alpha_lambda=lr_lambda, initial_lambda=init_l)
+    lagrangian_agent = PPO_LagrangianWrapper(runner, min_safety=min_safety, alpha_lambda=lr_lambda, initial_lambda=init_l, decrease_lr=decrease_lr)
     print("[INFO] PPO-Lagrangian wrapper created.")
 
     chunk_timesteps = agent_cfg["trainer"]["timesteps"]
