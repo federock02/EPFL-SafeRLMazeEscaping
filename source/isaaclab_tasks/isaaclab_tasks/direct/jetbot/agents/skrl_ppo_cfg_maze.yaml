@@ -15,7 +15,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [192, 128, 64]
+        layers: [192, 128]
         activations: relu
     output: ACTIONS
   value:  # see deterministic_model parameters
@@ -24,7 +24,7 @@ models:
     network:
       - name: net
         input: STATES
-        layers: [192, 128, 64]
+        layers: [192, 128]
         activations: relu
     output: ONE
 
@@ -71,10 +71,30 @@ agent:
     write_interval: auto
     checkpoint_interval: auto
 
+# Lagrangian configuration
+lagrangian:
+  initial_lambda: 0.0
+  cost_limit: 0.001
+  min_safety_probability: 0.75
+  learning_rate_lambda: 0.5
+  decay_lambda_lr: True
 
 # Sequential trainer
 # https://skrl.readthedocs.io/en/latest/api/trainers/sequential.html
 trainer:
   class: SequentialTrainer
-  timesteps: 40000
+  timesteps: 200
   environment_info: log
+  total_timesteps: 200000
+
+# Environment configuration
+rewards:
+  goal: 20
+  distance: 1
+  termination: -4
+  time: null
+  movement: null # has to be positive
+  movement_threshold: null
+costs:
+  obstacle: 20
+min_dist: 0.12

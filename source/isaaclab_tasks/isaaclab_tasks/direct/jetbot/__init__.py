@@ -98,3 +98,14 @@ gym.register(
         "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg_maze.yaml",
     },
 )
+
+gym.register(
+    id="Isaac-JetBot-Maze-Prob-RL-Direct-v0",
+    entry_point=f"{__name__}.jetbot_maze_prob_lagrangian_env:JetBotEnv",
+    disable_env_checker=True,
+    kwargs={
+        "env_cfg_entry_point": f"{__name__}.jetbot_maze_prob_lagrangian_env:JetBotEnvCfg",
+        "sb3_cfg_entry_point": f"{agents.__name__}:sb3_ppo_cfg_maze.yaml",
+        "skrl_cfg_entry_point": f"{agents.__name__}:skrl_ppo_cfg_maze.yaml",
+    },
+)
