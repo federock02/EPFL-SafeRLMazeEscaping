@@ -90,6 +90,10 @@ class JetBotEnvCfg(DirectRLEnvCfg):
     max_distance_from_goal: float = 3.5
     spawn_height: float = 0.0437
 
+    # Discretization
+    grid_boundaries = (-1.5, 1.5, -3.0, 3.0)  # x_min, x_max, y_min, y_max
+    grid_cell_size: float = 0.5
+
     # World
     wall_width: float = 0.05
     goal_pos = [[-2.0,1.0], [-2.0,0.0], [2.0,0.0], [0.5,3.5], [-0.5,-3.5]]
@@ -118,7 +122,7 @@ class JetBotEnv(DirectRLEnv):
         self.previous_distance_to_goal = torch.zeros(self.num_envs, device=self.device)
 
         # gamma for reward computation
-        config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_lagrangian_cfg.yaml")
+        config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_cfg_maze.yaml")
         print("Config path: ", config_path)
         try:
             with open(config_path) as stream:
@@ -132,6 +136,8 @@ class JetBotEnv(DirectRLEnv):
                 self.movement_threshold = data["rewards"].get("movement_threshold")
                 self.cost_obstacle = data["costs"]["obstacle"]
                 self.min_distance_to_obstacle = data["min_dist"]
+                self.reward_scale_exploration = data["rewards"].get("exploration_reward")
+                self.penalty_scale_exploration = data["rewards"].get("exploration_penalty")
         except yaml.YAMLError as exc:
             print(f"Error loading YAML config: {exc}. Using default reward/cost parameters.")
             self.gamma = 0.99
@@ -143,6 +149,8 @@ class JetBotEnv(DirectRLEnv):
             self.movement_threshold = None
             self.cost_obstacle = 1.0
             self.min_distance_to_obstacle = 0.18
+            self.reward_scale_exploration = None
+            self.penalty_scale_exploration = 0.0
 
         print("Gamma: ", self.gamma)
         print("Reward scale goal: ", self.reward_scale_goal)
@@ -150,6 +158,8 @@ class JetBotEnv(DirectRLEnv):
         print("Reward scale terminated: ", self.reward_scale_terminated)
         print("Cost obstacle: ", self.cost_obstacle)
         print("Min dist to obstacle: ", self.min_distance_to_obstacle)
+        print("Exploration reward: ", self.reward_scale_exploration)
+        print("Exploration penalty: ", self.penalty_scale_exploration)
 
         self.dual_multiplier = 0.0
         self.n_envs = self.cfg.scene.num_envs
@@ -158,6 +168,14 @@ class JetBotEnv(DirectRLEnv):
         self.episode_costs = torch.zeros(self.num_envs, device=self.device)
         self.last_episode_costs = torch.zeros(self.num_envs, device=self.device)
         self.safety_indicator = torch.ones(self.num_envs, device=self.device)
+
+        if self.reward_scale_exploration is not None:
+            #self.exploration_tracker = ExplorationTracker(self.cfg.scene.num_envs, self.device, self.cfg.grid_boundaries,
+                                                      #self.exploration_reward, self.exploration_penalty, cell_size=0.3)
+            
+            num_cells = int((self.cfg.grid_boundaries[1] - self.cfg.grid_boundaries[0]) / self.cfg.grid_cell_size) * int((self.cfg.grid_boundaries[3] - self.cfg.grid_boundaries[2]) / self.cfg.grid_cell_size)
+            print("Number of cells: ", num_cells)
+            self.grids = torch.zeros(self.cfg.scene.num_envs, num_cells, device=self.device)
 
         self.logger = CustomCSVLogger()
 
@@ -217,7 +235,7 @@ class JetBotEnv(DirectRLEnv):
 
         # Compute distance to goal and yaw difference to goal using LOS check
         # Pass robot_pos (shape [num_envs, 2]) and yaw (shape [num_envs])
-        distance_to_goal_los, yaw_difference_los = self._get_distance_and_angle_from_goal_with_los_check(position, yaw)
+        distance_to_goal_los, yaw_difference_los = self._get_distance_and_angle_from_goal_with_los_check(position, yaw, check_los=False)
         # print("Position: ", position.shape)
         # print("Distance to goal: ", distance_to_goal_los.shape)
         # print("Yaw difference: ", yaw_difference_los.shape)
@@ -244,7 +262,23 @@ class JetBotEnv(DirectRLEnv):
         distances_to_obstacles = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2])
 
         # Compute the minimum distance to goal with line-of-sight check
-        current_distance_to_goal = self._get_distance_from_goal_with_los_check()
+        current_distance_to_goal = self._get_distance_from_goal_with_los_check(check_los=False)
+
+        if self.reward_scale_exploration is not None:
+            current_robot_positions_xy = self.jetbot.data.root_pos_w[:, :2]  # (num_envs, 2)
+            grid_pos = self._get_cell(current_robot_positions_xy).squeeze(-1)  # (num_envs,)
+
+            # Get current values at those grid cells
+            grid_values = self.grids[torch.arange(self.cfg.scene.num_envs, device=self.device), grid_pos]  # (num_envs,)
+
+            # Detect which envs are visiting a new cell (value was 0)
+            is_new_cell = (grid_values == 0)
+
+            # Set those grid cells to 1 (mark as visited)
+            self.grids[torch.arange(self.cfg.scene.num_envs, device=self.device)[is_new_cell], grid_pos[is_new_cell]] = 1
+            #print("Grid 0 new: ", self.grids[0,:])
+            
+            #print("Grid position: ", self.grids[0,:])
 
         # Compute individual reward components and total primary reward
         distance_reward, goal_reward, termination_reward, primary_reward = compute_rewards(
@@ -255,6 +289,9 @@ class JetBotEnv(DirectRLEnv):
             self.jetbot.data.root_pos_w[:, :2],  # Robot root position (x, y)
             self.previous_distance_to_goal,  # Previous distance to goal
             current_distance_to_goal,  # Current distance to goal
+            self.reward_scale_exploration,
+            self.penalty_scale_exploration,
+            is_new_cell,  # New cell value for exploration
         )
         # Update previous distance to goal for the next step
         self.previous_distance_to_goal = current_distance_to_goal
@@ -324,6 +361,13 @@ class JetBotEnv(DirectRLEnv):
             env_ids = self.jetbot._ALL_INDICES
         super()._reset_idx(env_ids)
 
+        if self.reward_scale_exploration is not None:
+            # Reset the exploration tracker for the environments being reset
+            # self.exploration_tracker.reset(env_ids)
+            # Reset the grid for the environments being reset
+            self.grids[env_ids] = 0
+
+
         # sample a new starting position within initial_pose_radius around the goal
         num_ids = len(env_ids)
 
@@ -366,7 +410,7 @@ class JetBotEnv(DirectRLEnv):
         # reset safety indicator for the reset environments
         self.safety_indicator[env_ids] = 1
     
-    def _get_distance_from_goal_with_los_check(self, los_check=True) -> torch.Tensor:
+    def _get_distance_from_goal_with_los_check(self, check_los=True) -> torch.Tensor:
         """
         Computes the minimum distance to goals, considering line-of-sight to maze walls.
         If line-of-sight to a goal is blocked by a wall, that goal's distance is treated as 10.0.
@@ -390,7 +434,7 @@ class JetBotEnv(DirectRLEnv):
         diff = robot_pos.unsqueeze(1) - all_goals.unsqueeze(0)
         euclidean_dists = torch.norm(diff, dim=2)  # Shape: [num_envs, num_goals]
 
-        if los_check:
+        if check_los:
             # Prepare line segments for LOS check: from each robot to each goal
             # line_starts_flat shape: [num_envs * num_goals, 2]
             line_starts_flat = robot_pos.unsqueeze(1).expand(-1, num_goals, -1).reshape(num_envs * num_goals, 2)
@@ -505,6 +549,35 @@ class JetBotEnv(DirectRLEnv):
             yaw_diff_to_final_goal = (angle_to_closest_goal_no_los - robot_yaw + torch.pi) % (2 * torch.pi) - torch.pi # Shape: [num_envs]
 
         return min_final_dists.unsqueeze(1), yaw_diff_to_final_goal.unsqueeze(1)
+    
+    def _get_cell(self, robot_pos: torch.Tensor) -> torch.Tensor:
+        """
+        Computes the grid cell index for each robot position.
+        The grid is defined by the boundaries and cell size.
+        The grid position is returned as a single index, since the grid is linearized.
+
+        Args:
+            robot_pos (torch.Tensor): Robot positions, shape [num_envs, 2].
+
+        Returns:
+            torch.Tensor: Grid cell indices, shape [num_envs, 1].
+        """
+        x_min, x_max, y_min, y_max = self.cfg.grid_boundaries
+        cell_size = self.cfg.grid_cell_size
+
+        max_x = int((x_max - x_min) / cell_size)
+
+        # Compute grid indices
+        grid_x = ((robot_pos[:, 0] - x_min) / cell_size).long()
+        grid_y = ((robot_pos[:, 1] - y_min) / cell_size).long()
+
+        # Ensure indices are within bounds
+        grid_x = torch.clamp(grid_x, 0, int((x_max - x_min) / cell_size) - 1)
+        grid_y = torch.clamp(grid_y, 0, int((y_max - y_min) / cell_size) - 1)
+
+        grid_pos = grid_x + max_x * grid_y
+
+        return grid_pos.unsqueeze(-1)  # Shape: [num_envs, 1] 
 
     def _compute_yaw(self, quaternions: torch.Tensor) -> torch.Tensor:
         """
@@ -556,6 +629,9 @@ def compute_rewards(
     robot_pos: torch.Tensor,
     previous_distance_to_goal: torch.Tensor,
     current_distance_to_goal: torch.Tensor,
+    rew_scale_exploration: float | None,
+    penalty_scale_exploration: float | None,
+    new_cell: torch.Tensor | None,
 ):
     # reward for termination
     terminated = torch.any(torch.abs(robot_pos) > max_distance_from_goal, dim=1).float()
@@ -571,6 +647,16 @@ def compute_rewards(
     rew_distance = rew_scale_distance * rew_distance
     # clip distance reward to 0 as minimum
     rew_distance = torch.clamp(rew_distance, min=0.0)
+
+    # reward for exploration
+    if rew_scale_exploration is not None and penalty_scale_exploration is not None and new_cell is not None:
+        # reward for exploration
+        rew_exploration = rew_scale_exploration * new_cell.float()
+        # penalty for exploration
+        penalty_exploration = penalty_scale_exploration * (1 - new_cell.float())
+        rew_exploration = rew_exploration + penalty_exploration
+
+        total_reward = rew_distance + rew_goal + rew_termination + rew_exploration
 
     total_reward = rew_distance + rew_goal + rew_termination
   

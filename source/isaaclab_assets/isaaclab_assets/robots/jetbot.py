@@ -18,8 +18,8 @@ JETBOT_CFG = ArticulationCfg(
         usd_path=os.path.join(ROBOT_DIR, "usd_files", "jetbot.usd"),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(
             rigid_body_enabled=True,
-            max_linear_velocity=30.0,
-            max_angular_velocity=30.0,
+            max_linear_velocity=2.0,
+            max_angular_velocity=2.0,
             max_depenetration_velocity=1.0,
             enable_gyroscopic_forces=True,
         ),
@@ -39,14 +39,14 @@ JETBOT_CFG = ArticulationCfg(
         "left_wheel": ImplicitActuatorCfg(
             joint_names_expr=["left_wheel_joint"],
             effort_limit=500.0,
-            velocity_limit=500.0,
+            velocity_limit=10.0,
             stiffness=0.0,
             damping=2.0,
         ),
         "right_wheel": ImplicitActuatorCfg(
             joint_names_expr=["right_wheel_joint"],
             effort_limit=500.0,
-            velocity_limit=500.0,
+            velocity_limit=10.0,
             stiffness=0.0,
             damping=5.0,
         ),

@@ -74,9 +74,9 @@ agent:
 # Lagrangian configuration
 lagrangian:
   initial_lambda: 0.0
-  cost_limit: 0.001
-  min_safety_probability: 0.75
-  learning_rate_lambda: 0.5
+  cost_limit: 0.0005
+  min_safety_probability: 0.9
+  learning_rate_lambda: 0.1
   decay_lambda_lr: True
 
 # Sequential trainer
@@ -89,12 +89,14 @@ trainer:
 
 # Environment configuration
 rewards:
-  goal: 20
-  distance: 1
-  termination: -4
+  goal: 50
+  distance: 10
+  termination: -10
   time: null
   movement: null # has to be positive
   movement_threshold: null
+  exploration_reward: 5
+  exploration_penalty: 0.0
 costs:
-  obstacle: 20
-min_dist: 0.12
+  obstacle: 10
+min_dist: 0.15
