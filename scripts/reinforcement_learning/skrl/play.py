@@ -15,6 +15,9 @@ a more user-friendly way.
 import argparse
 
 from isaaclab.app import AppLauncher
+from gymnasium.spaces import Box
+import numpy as np
+import csv
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Play a checkpoint of an RL agent from skrl.")
@@ -160,8 +163,15 @@ def main():
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+    print(f"Action space: {env.action_space}")
+    env.action_space = Box(low=np.array([-4.0, -4.0], dtype=np.float32), high=np.array([+4.0, +4.0], dtype=np.float32), dtype=np.float32)
+    print(f"Action space after edit: {env.action_space}")
+
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+
+    print(f"[INFO] Environment: {env}")
+    print(f"Action space: {env.action_space}")
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html
@@ -178,6 +188,10 @@ def main():
     # reset environment
     obs, _ = env.reset()
     timestep = 0
+    iterations = 0
+    success_rate = 0.0
+    safety_probability = 0.0
+    traj = [[] for _ in range(env.num_envs)]  # trajectory for each environment
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
@@ -187,8 +201,24 @@ def main():
             # agent stepping
             outputs = runner.agent.act(obs, timestep=0, timesteps=0)
             actions = outputs[-1].get("mean_actions", outputs[0])
+            # print(f"[INFO] Actions: {actions}")
             # env stepping
-            obs, _, _, _, _ = env.step(actions)
+            obs, _, dones, _, _ = env.step(actions)
+
+            # for i, done in enumerate(dones):
+            #     if done:
+            #         with open("trajectory.csv", "a") as csvfile:
+            #             writer = csv.writer(csvfile)
+            #             # write the trajectory for the environment
+            #             print(traj[i])
+            #             writer.writerow(traj[i])
+            #         traj[i] = []  # reset trajectory for the environment
+            #     else:
+            #         # append the current observation to the trajectory
+            #         # print(f"Observation env {i}: {obs[i].flatten().cpu().numpy()}")
+            #         traj[i].append(obs[i,0:2].flatten().cpu().numpy().tolist())
+            #print(f"Success rate: {env.unwrapped._get_success_rate()}")
+            #print(f"Safety probability: {env.unwrapped._get_safety_probability()}")
         if args_cli.video:
             timestep += 1
             # exit the play loop after recording one video
@@ -199,6 +229,14 @@ def main():
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
+        
+
+        # success_rate += env.unwrapped._get_success_rate()
+        # safety_probability += env.unwrapped._get_safety_probability()
+        iterations += 1
+
+        print(f"Success rate: {success_rate/iterations:.4f}")
+        print(f"Safety probability: {safety_probability/iterations:.4f}")
 
     # close the simulator
     env.close()

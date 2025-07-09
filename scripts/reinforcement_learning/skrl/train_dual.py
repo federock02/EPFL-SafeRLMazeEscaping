@@ -16,6 +16,8 @@ import argparse
 import sys
 
 from isaaclab.app import AppLauncher
+from gymnasium.spaces import Box
+import numpy as np
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
@@ -162,17 +164,17 @@ class PPO_LagrangianWrapper:
         Assumes that _get_constraint_cost() returns a tensor of shape [num_envs, 1].
         """
         constraint_costs = self.env._get_constraint_cost()  # shape: (num_envs, 1)
-        constraint_costs = constraint_costs / self.chunk
         return constraint_costs.mean().item()
 
-    def update_dual(self):
+    def update_dual(self, progress=0.0):
         """
         Update the dual variable (Lagrange multiplier) based on the current constraint cost.
         """
         # constraint_cost = self.env._get_last_episode_costs().mean().item()
         constraint_cost = self.compute_total_constraint_cost()
+        learning_rate = self.alpha_lambda * (1 - progress)
         # Dual update (gradient ascent) with projection onto non-negative values:
-        self.lambda_val = max(0.0, self.lambda_val + self.alpha_lambda * (constraint_cost - self.constraint_limit))
+        self.lambda_val = max(0.0, self.lambda_val + learning_rate * (constraint_cost - self.constraint_limit))
         # Update the environment with the new dual value:
         self.env._set_dual_multiplier(self.lambda_val)
         print(f"Dual updated: {self.lambda_val:.4f} (constraint cost: {constraint_cost:.4f}, limit: {self.constraint_limit:.4f})")
@@ -185,6 +187,8 @@ class PPO_LagrangianWrapper:
         print(f"Chunk timesteps: {self.chunk}")
         self.start_time = datetime.now()
         while self.total_timesteps_run < total_timesteps:
+            if self.total_timesteps_run > 10000:
+                self.env._set_distance_rew(1)
 
             # reset reward and cost accumulators
             self.env._reset_reward_and_cost()
@@ -199,8 +203,10 @@ class PPO_LagrangianWrapper:
             safety_prob = self.env._get_safety_probability().item()
             total_reward = mean_reward - self.lambda_val * mean_cost
 
+            progress = self.total_timesteps_run / total_timesteps
+
             # Update the dual variable
-            self.update_dual()
+            self.update_dual(progress)
             #self.env._domain_randomize()
 
             # Log current timestep and statistics
@@ -289,6 +295,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print("[INFO] Recording videos during training.")
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
+
+    print(f"Action space: {env.action_space}")
+    env.action_space = Box(low=np.array([-4.0, -4.0], dtype=np.float32), high=np.array([+4.0, +4.0], dtype=np.float32), dtype=np.float32)
+    print(f"Action space after edit: {env.action_space}")
 
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`

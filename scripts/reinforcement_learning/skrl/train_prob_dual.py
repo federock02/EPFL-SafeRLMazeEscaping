@@ -16,6 +16,8 @@ import argparse
 import sys
 
 from isaaclab.app import AppLauncher
+from gymnasium.spaces import Box
+import numpy as np
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Train an RL agent with skrl.")
@@ -177,6 +179,8 @@ class PPO_LagrangianWrapper:
         print(f"Chunk timesteps: {self.chunk}")
         self.start_time = datetime.now()
         while self.total_timesteps_run < total_timesteps:
+            if self.total_timesteps_run > 10000:
+                self.env._set_distance_rew(1)
 
             # reset reward and cost accumulators
             self.env._reset_reward_and_cost()
@@ -184,12 +188,15 @@ class PPO_LagrangianWrapper:
             # Run training for a chunk
             self.runner.run()
             self.total_timesteps_run += chunk_timesteps
+            print(f"Total timesteps run: {self.total_timesteps_run}")
+            # print(f"Env step count: {self.env.i}")
 
             r, c = self.env._get_reward_and_cost()
             mean_reward = r.mean().item()
             mean_cost = c.mean().item()
             safety_prob = self.env._get_safety_probability().item()
-            total_reward = mean_reward + self.lambda_val * safety_prob
+            unsafety_prob = 1.0 - safety_prob
+            total_reward = mean_reward - self.lambda_val * unsafety_prob
             # total_reward = mean_reward - self.lambda_val * mean_cost
 
             progress = self.total_timesteps_run / total_timesteps
@@ -269,6 +276,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
     print(f"[INFO] Environment created")
 
+    print(f"Action space: {env.action_space}")
+    # env.action_space = Box(low=np.full((4096, 2), -4.0, dtype=np.float32),
+    #                        high=np.full((4096, 2), +4.0, dtype=np.float32),
+    #                        shape=(4096, 2), dtype=np.float32
+    #                        )
+    # print(f"Action space after edit: {env.action_space}")
+    new_action_space_low = np.full((2,), -4.0, dtype=np.float32)
+    new_action_space_high = np.full((2,), +4.0, dtype=np.float32)
+
+    # Directly assign the new Box space to the wrapper's action_space attribute.
+    # This will update the space that the Runner (and thus the policy) sees.
+    env.action_space = Box(low=new_action_space_low,
+                           high=new_action_space_high,
+                           shape=(2,), # This must match the per-environment action dimension
+                           dtype=np.float32)
+
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv) and algorithm in ["ppo"]:
         env = multi_agent_to_single_agent(env)
@@ -285,8 +308,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         print_dict(video_kwargs, nesting=4)
         env = gym.wrappers.RecordVideo(env, **video_kwargs)
 
+
     # wrap around environment for skrl
     env = SkrlVecEnvWrapper(env, ml_framework=args_cli.ml_framework)  # same as: `wrap_env(env, wrapper="auto")`
+
+    print(f"Action space of SkrlVecEnvWrapper (after override): {env.action_space}")
+
 
     # configure and instantiate the skrl runner
     # https://skrl.readthedocs.io/en/latest/api/utils/runner.html

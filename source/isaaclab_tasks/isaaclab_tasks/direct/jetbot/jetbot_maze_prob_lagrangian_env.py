@@ -63,8 +63,8 @@ def get_unwrapped_env(env):
 @configclass
 class JetBotEnvCfg(DirectRLEnvCfg):
     # env
-    decimation: int = 1
-    episode_length_s: float = 20.0
+    decimation: int = 4 
+    episode_length_s: float = 120.0
     action_scale: float = 1.0
     action_space: int = 2
     # observation_space: int = 10 # x, y, distance_to_goal_x, distance_to_goal_y, yaw_diff, base_lin_vel, base_ang_vel, 3*distance_to_obstacle
@@ -74,7 +74,7 @@ class JetBotEnvCfg(DirectRLEnvCfg):
 
 
     # simulation
-    sim: SimulationCfg = SimulationCfg(dt=1 / 120, render_interval=decimation)
+    sim: SimulationCfg = SimulationCfg(dt=1 / 20, render_interval=decimation)
 
     # robot
     # the path represent the position of the robot prim in the hierarchical representation of the scene
@@ -122,7 +122,7 @@ class JetBotEnv(DirectRLEnv):
         self.previous_distance_to_goal = torch.zeros(self.num_envs, device=self.device)
 
         # gamma for reward computation
-        config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_lagrangian_cfg.yaml")
+        config_path = os.path.join(os.path.dirname(__file__), "agents", "skrl_ppo_cfg_maze.yaml")
         print("Config path: ", config_path)
         try:
             with open(config_path) as stream:
@@ -131,9 +131,6 @@ class JetBotEnv(DirectRLEnv):
                 self.reward_scale_goal = data["rewards"]["goal"]
                 self.reward_scale_distance = data["rewards"]["distance"]
                 self.reward_scale_terminated = data["rewards"]["termination"]
-                self.reward_scale_time = data["rewards"].get("time")  # Use .get() for optional key
-                self.reward_scale_movement = data["rewards"].get("movement")
-                self.movement_threshold = data["rewards"].get("movement_threshold")
                 self.cost_obstacle = data["costs"]["obstacle"]
                 self.min_distance_to_obstacle = data["min_dist"]
                 self.reward_scale_exploration = data["rewards"].get("exploration_reward")
@@ -141,14 +138,11 @@ class JetBotEnv(DirectRLEnv):
         except yaml.YAMLError as exc:
             print(f"Error loading YAML config: {exc}. Using default reward/cost parameters.")
             self.gamma = 0.99
-            self.reward_scale_goal = 30.0
-            self.reward_scale_distance = 50.0
-            self.reward_scale_terminated = -80.0
-            self.reward_scale_time = None
-            self.reward_scale_movement = None
-            self.movement_threshold = None
-            self.cost_obstacle = 1.0
-            self.min_distance_to_obstacle = 0.18
+            self.reward_scale_goal = 60.0
+            self.reward_scale_distance = 10.0
+            self.reward_scale_terminated = -50.0
+            self.cost_obstacle = 6.0
+            self.min_distance_to_obstacle = 0.15
             self.reward_scale_exploration = None
             self.penalty_scale_exploration = 0.0
 
@@ -180,6 +174,9 @@ class JetBotEnv(DirectRLEnv):
 
         self.logger = CustomCSVLogger()
 
+        self.spawned_robots = 0
+        self.failed_robots = 0
+
     def _setup_scene(self):
         self.jetbot = Articulation(self.cfg.robot_cfg)
 
@@ -207,11 +204,13 @@ class JetBotEnv(DirectRLEnv):
         self.maze.spawn_maze(width=self.cfg.wall_width, height=0.5)
 
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
-        self.actions = self.action_scale * actions.clone()
+        self.actions = actions.clone()
+        #self.actions = torch.tanh(self.actions) * 6.0  # Ensure actions are in [-6, 6] range
 
     def _apply_action(self) -> None:
         left_action = self.actions[:, 0].unsqueeze(-1)
         right_action = self.actions[:, 1].unsqueeze(-1)
+        #print("Left action: ", left_action, "\nRight action: ", right_action)
         self.jetbot.set_joint_velocity_target(left_action, joint_ids=self._left_wheel_idx)
         self.jetbot.set_joint_velocity_target(right_action, joint_ids=self._right_wheel_idx)
 
@@ -236,7 +235,7 @@ class JetBotEnv(DirectRLEnv):
 
         # Compute distance to goal and yaw difference to goal using LOS check
         # Pass robot_pos (shape [num_envs, 2]) and yaw (shape [num_envs])
-        distance_to_goal_los, yaw_difference_los = self._get_distance_and_angle_from_goal_with_los_check(position, yaw, check_los=True)
+        distance_to_goal_los, yaw_difference_los = self._get_distance_and_angle_from_goal_with_los_check(position, yaw, check_los=False)
         # Both returned tensors will be shape [num_envs, 1]
         # print("Position: ", position.shape)
         # print("Distance to goal: ", distance_to_goal.shape)
@@ -264,7 +263,9 @@ class JetBotEnv(DirectRLEnv):
         distances_to_obstacles = self.maze.check_collision(self.jetbot.data.root_pos_w[:, :2])
 
         # Compute the minimum distance to goal with line-of-sight check
-        current_distance_to_goal = self._get_distance_from_goal_with_los_check(check_los=True)
+        current_distance_to_goal = self._get_distance_from_goal_with_los_check(check_los=False)
+
+        is_new_cell = None
 
         if self.reward_scale_exploration is not None:
             current_robot_positions_xy = self.jetbot.data.root_pos_w[:, :2]  # (num_envs, 2)
@@ -328,16 +329,23 @@ class JetBotEnv(DirectRLEnv):
         # Get safety probability
         safety_probability = self._get_safety_probability().item()
         unsafety_probability = 1 - safety_probability
+        #print("Constraint cost: ", constraint_cost)
+        #print("Unsafety probability: ", unsafety_probability)
 
         # Log the reward and cost information
         total_lagrangian_reward = mean_total_reward - self.dual_multiplier * mean_total_cost
+        total_lag_prob = mean_total_reward - self.dual_multiplier * unsafety_probability
+        #print("Total Lagrangian reward: ", total_lag_prob)
+        #print("Cost lagrangian reward: ", total_lagrangian_reward)
         self.logger.record(self.dual_multiplier, mean_distance_reward, std_distance_reward,
                            mean_goal_reward, std_goal_reward, mean_termination_reward, std_termination_reward,
                            mean_total_reward, std_total_reward, mean_total_cost, std_total_cost,
                            total_lagrangian_reward, safety_probability)
 
         # Return the Lagrangian reward
-        return primary_reward - self.dual_multiplier * unsafety_probability
+        lag_rew = primary_reward - self.dual_multiplier * unsafety_probability
+        #print("Lagrangian reward: ", lag_rew)
+        return lag_rew
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # check if the episode has run out of time
@@ -345,6 +353,9 @@ class JetBotEnv(DirectRLEnv):
 
         # check if the robot has gone out of bounds
         out_of_bounds = torch.any(torch.abs(self.jetbot.data.root_pos_w[:, :2]) > self.cfg.max_distance_from_goal, dim=1)
+
+        self.failed_robots += torch.sum(out_of_bounds).item()
+        self.failed_robots += torch.sum(time_out).item()
 
         # check if the robot has reached the goal
         robot_pos = self.jetbot.data.root_pos_w[:, :2]
@@ -373,6 +384,8 @@ class JetBotEnv(DirectRLEnv):
 
         # sample a new starting position within initial_pose_radius around the goal
         num_ids = len(env_ids)
+
+        self.spawned_robots += num_ids
 
         # vectorized sample
         safe_positions = self.maze.sample_safe_positions(
@@ -619,6 +632,12 @@ class JetBotEnv(DirectRLEnv):
     
     def _get_reward_and_cost(self):
         return self.episode_rewards, self.episode_costs
+    
+    def _set_distance_rew(self, value):
+        self.reward_scale_distance = value
+
+    def _get_success_rate(self) -> float:
+        return (1 - (self.failed_robots / self.spawned_robots) if self.spawned_robots > 0 else 0.0)
 
 # decorator to compile the function to TorchScript
 # https://pytorch.org/docs/stable/jit.html

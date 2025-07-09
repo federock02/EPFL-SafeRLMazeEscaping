@@ -85,7 +85,7 @@ trainer:
   class: SequentialTrainer
   timesteps: 200
   environment_info: log
-  total_timesteps: 100000
+  total_timesteps: 130000
 
 # Environment configuration
 rewards:
