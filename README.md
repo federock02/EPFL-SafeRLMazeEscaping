@@ -8,23 +8,23 @@ The codebase is organized into the following key directories:
 
 * **JetBot Environments**
   All JetBot RL environments are defined in:
-  `/home/federico/isaaclab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/`
+  `/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/`
 
 * **Training Configuration**
   RL agent configurations (e.g., PPO, SAC) are located in:
-  `/home/federico/isaaclab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/agents/`
+  `/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/agents/`
 
 * **Robot Definition**
   The JetBot robot model and asset description are defined in:
-  `/home/federico/isaaclab/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/jetbot.py`
+  `/IsaacLab/source/isaaclab_assets/isaaclab_assets/robots/jetbot.py`
 
 * **Training & Inference Scripts**
   Scripts for training and running inference are located in:
-  `/home/federico/isaaclab/IsaacLab/scripts/reinforcement_learning/skrl/`
+  `/IsaacLab/scripts/reinforcement_learning/skrl/`
 
 * **Environment Registration**
   The environment IDs required for training/inference are registered in:
-  `/home/federico/isaaclab/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/__init__.py`
+  `/IsaacLab/source/isaaclab_tasks/isaaclab_tasks/direct/jetbot/__init__.py`
 
 ## Running Training
 
@@ -49,7 +49,7 @@ Run inference using a pretrained checkpoint:
 ./isaaclab.sh -p scripts/reinforcement_learning/skrl/play.py \
     --task Isaac-JetBot-Maze-RL-Direct-v2 \
     --num_envs 16 \
-    --checkpoint /home/federico/isaaclab/IsaacLab/logs/skrl/jetbot_direct_maze_ppo/.../saves/your_model.pt
+    --checkpoint /IsaacLab/logs/skrl/jetbot_direct_maze_ppo/.../saves/your_model.pt
 ```
 
 * `--checkpoint`: path to the saved model `.pt` file
