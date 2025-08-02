@@ -150,13 +150,13 @@ class PPO_LagrangianWrapper:
         self.min_safety = min_safety
         self.alpha_lambda = alpha_lambda
         self.lambda_val = initial_lambda  # dual variable
-        self.logger = CustomCSVLogger()  # Initialize a custom CSV logger
+        # self.logger = CustomCSVLogger()  # Initialize a custom CSV logger
         self.total_timesteps_run = 0
         self.chunk = None
 
         # Set the dual multiplier in the environment so that the reward function uses it
         self.env._set_dual_multiplier(self.lambda_val)
-        self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0, 0.0)
+        # self.logger.record(0, self.lambda_val, 0.0, 0.0, 0.0, 0.0)
 
     def update_dual(self, progress=0.0):
         """
@@ -206,7 +206,7 @@ class PPO_LagrangianWrapper:
             #self.env._domain_randomize()
 
             # Log current timestep and statistics
-            self.logger.record(self.total_timesteps_run, self.lambda_val, mean_reward, mean_cost, total_reward, safety_prob)
+            # self.logger.record(self.total_timesteps_run, self.lambda_val, mean_reward, mean_cost, total_reward, safety_prob)
             print(f"Progress: {progress*100:.2f}%")
             print("Expected time remaining: ", (datetime.now() - self.start_time) * (total_timesteps - self.total_timesteps_run) / self.total_timesteps_run)
             
