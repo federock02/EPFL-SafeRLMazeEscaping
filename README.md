@@ -2,6 +2,9 @@
 
 This project defines and trains JetBot-based navigation tasks using the Isaac Sim + Isaac Lab framework with reinforcement learning.
 
+https://github.com/user-attachments/assets/c1ab1d11-bdcf-419a-8325-966c9e84c1c9
+
+
 ## Project Structure
 
 The codebase is organized into the following key directories:
