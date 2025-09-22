@@ -1,6 +1,7 @@
 # JetBot RL Project (Isaac Lab)
 
 This project defines and trains JetBot-based navigation tasks using the Isaac Sim + Isaac Lab framework with reinforcement learning.
+The final report can be seen [here](https://github.com/federock02/EPFL-SafeRLMazeEscaping/blob/main/SafeReinforcementLearning.pdf)
 
 https://github.com/user-attachments/assets/c1ab1d11-bdcf-419a-8325-966c9e84c1c9
 
